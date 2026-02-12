@@ -7,6 +7,7 @@ public class RedisKeyConstant {
     public static final String SEAT_STATUS = "seat:status:";
     public static final String USER_BOUGHT = "user:bought:";
     public static final String ORDER_TOKEN = "order:token:";
+    public static final String USER_TOKEN = "user:token:";
 
     private RedisKeyConstant() {}
 }

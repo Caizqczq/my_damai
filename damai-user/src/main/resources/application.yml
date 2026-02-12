@@ -22,9 +22,14 @@ spring:
     redis:
       host: localhost
       port: 6379
+      password: 123456
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
   configuration:
     map-underscore-to-camel-case: true
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+jwt:
+  secret: damai-ticket-secret-key-2026-must-be-at-least-32-bytes
+  expiration-ms: 86400000

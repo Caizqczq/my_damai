@@ -46,7 +46,6 @@ public class AuthFilter implements GlobalFilter, Ordered {
 
         String token = authHeader.substring(7);
 
-        // 解析 JWT
         Claims claims;
         try {
             claims = jwtUtil.parseToken(token);
@@ -57,21 +56,19 @@ public class AuthFilter implements GlobalFilter, Ordered {
 
         String userId = claims.getSubject();
 
-        // 校验 Redis 中 token 是否仍有效（支持登出失效）
         return redisTemplate.opsForValue()
                 .get(USER_TOKEN_PREFIX + userId)
+                .defaultIfEmpty("")
                 .flatMap(storedToken -> {
-                    if (!token.equals(storedToken)) {
+                    if (storedToken.isEmpty() || !token.equals(storedToken)) {
                         return unauthorized(exchange);
                     }
-                    // 将 userId 写入请求头，传递给下游服务
                     ServerHttpRequest request = exchange.getRequest().mutate()
                             .header("X-User-Id", userId)
                             .header("X-User-Name", claims.get("username", String.class))
                             .build();
                     return chain.filter(exchange.mutate().request(request).build());
-                })
-                .switchIfEmpty(unauthorized(exchange));
+                });
     }
 
     private Mono<Void> unauthorized(ServerWebExchange exchange) {

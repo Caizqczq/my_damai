@@ -13,6 +13,10 @@ public class ProgramController {
     
     private final ProgramService programService;
     
+    @GetMapping("/hello")
+    public Result<?> hello() {
+        return Result.ok("hello world");
+    }
 
     @GetMapping("/list")
     public Result<?> list(@RequestParam(required = false,value = "city") String city) {

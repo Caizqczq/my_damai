@@ -24,6 +24,5 @@ public class ProgramDetailDTO {
         private Long id;
         private String name;
         private BigDecimal price;
-        private Integer availableStock;
     }
 }

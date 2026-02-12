@@ -7,7 +7,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
-import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.stereotype.Component;
@@ -21,15 +20,12 @@ import java.util.List;
 @RequiredArgsConstructor
 public class AuthFilter implements GlobalFilter, Ordered {
 
-    private static final String USER_TOKEN_PREFIX = "user:token:";
-
     private static final List<String> WHITE_LIST = List.of(
             "/api/user/login",
             "/api/user/register"
     );
 
     private final JwtUtil jwtUtil;
-    private final ReactiveStringRedisTemplate redisTemplate;
 
     @Override
     public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
@@ -55,20 +51,11 @@ public class AuthFilter implements GlobalFilter, Ordered {
         }
 
         String userId = claims.getSubject();
-
-        return redisTemplate.opsForValue()
-                .get(USER_TOKEN_PREFIX + userId)
-                .defaultIfEmpty("")
-                .flatMap(storedToken -> {
-                    if (storedToken.isEmpty() || !token.equals(storedToken)) {
-                        return unauthorized(exchange);
-                    }
-                    ServerHttpRequest request = exchange.getRequest().mutate()
-                            .header("X-User-Id", userId)
-                            .header("X-User-Name", claims.get("username", String.class))
-                            .build();
-                    return chain.filter(exchange.mutate().request(request).build());
-                });
+        ServerHttpRequest request = exchange.getRequest().mutate()
+                .header("X-User-Id", userId)
+                .header("X-User-Name", claims.get("username", String.class))
+                .build();
+        return chain.filter(exchange.mutate().request(request).build());
     }
 
     private Mono<Void> unauthorized(ServerWebExchange exchange) {

@@ -23,7 +23,6 @@ public class Program {
     private String description;
     private Integer status;
     private Integer totalStock;
-    private Integer availableStock;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

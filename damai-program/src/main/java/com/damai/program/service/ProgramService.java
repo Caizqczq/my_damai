@@ -98,7 +98,6 @@ public class ProgramService {
             cd.setId(c.getId());
             cd.setName(c.getName());
             cd.setPrice(c.getPrice());
-            cd.setAvailableStock(c.getAvailableStock());
             return cd;
         }).toList());
         return dto;

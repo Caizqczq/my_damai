@@ -1,0 +1,43 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    name: damai-gateway
+  cloud:
+    nacos:
+      discovery:
+        server-addr: localhost:8848
+    gateway:
+      routes:
+        - id: program-service
+          uri: lb://damai-program
+          predicates:
+            - Path=/api/program/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 10000
+                redis-rate-limiter.burstCapacity: 15000
+                key-resolver: "#{@ipKeyResolver}"
+
+        - id: order-service
+          uri: lb://damai-order
+          predicates:
+            - Path=/api/order/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 5000
+                redis-rate-limiter.burstCapacity: 8000
+                key-resolver: "#{@userKeyResolver}"
+
+        - id: user-service
+          uri: lb://damai-user
+          predicates:
+            - Path=/api/user/**
+
+  data:
+    redis:
+      host: localhost
+      port: 6379

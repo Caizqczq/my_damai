@@ -21,6 +21,17 @@ spring:
       max-active: 50
       min-idle: 20
       initial-size: 20
+      stat-view-servlet:
+        enabled: true
+        login-username: admin
+        login-password: admin
+        allow: ""
+        url-pattern: /druid/*
+      filter:
+        stat:
+          enabled: true
+          slow-sql-millis: 1000
+          log-slow-sql: true
   data:
     redis:
       host: localhost

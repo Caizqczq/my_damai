@@ -1,6 +1,8 @@
 package com.damai.program.service;
 
+import com.alibaba.fastjson.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.damai.common.constant.RedisKeyConstant;
 import com.damai.common.exception.BizException;
 import com.damai.program.dto.ProgramDetailDTO;
 import com.damai.program.dto.ProgramListItem;
@@ -12,14 +14,16 @@ import com.damai.program.entity.TicketCategory;
 import com.damai.program.mapper.ProgramMapper;
 import com.damai.program.mapper.SeatMapper;
 import com.damai.program.mapper.TicketCategoryMapper;
+import com.github.benmanes.caffeine.cache.Cache;
 import lombok.RequiredArgsConstructor;
-import org.springframework.beans.BeanUtils;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Service
@@ -28,6 +32,8 @@ public class ProgramService {
     private final ProgramMapper programMapper;
     private final TicketCategoryMapper categoryMapper;
     private final SeatMapper seatMapper;
+    private final StringRedisTemplate redisTemplate;
+    private final Cache<Long,ProgramDetailDTO> programDetailCache;
     
     public List<ProgramListItem>list(String city){
         LambdaQueryWrapper<Program>wrapper = new LambdaQueryWrapper<>();
@@ -74,6 +80,17 @@ public class ProgramService {
     
     
     public ProgramDetailDTO detail(Long id){
+        ProgramDetailDTO localDto = programDetailCache.getIfPresent(id);
+        if (localDto != null) {
+            return localDto;
+        }
+        String cacheKey= RedisKeyConstant.PROGRAM_DETAIL+id;
+        String cache = redisTemplate.opsForValue().get(cacheKey);
+        if(cache!=null){
+            ProgramDetailDTO dto = JSON.parseObject(cache, ProgramDetailDTO.class);
+            programDetailCache.put(id,dto);
+            return dto;
+        }
         Program program = programMapper.selectById(id);
         if (program == null) {
             throw new BizException(1001, "节目不存在");
@@ -100,6 +117,8 @@ public class ProgramService {
             cd.setPrice(c.getPrice());
             return cd;
         }).toList());
+        redisTemplate.opsForValue().set(cacheKey, JSON.toJSONString(dto), 10, TimeUnit.MINUTES);
+        programDetailCache.put(id, dto);
         return dto;
     }
     

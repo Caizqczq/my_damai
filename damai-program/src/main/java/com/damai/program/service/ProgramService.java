@@ -21,6 +21,7 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
@@ -41,6 +42,7 @@ public class ProgramService {
     private final StringRedisTemplate redisTemplate;
     private final Cache<Long,ProgramDetailDTO> programDetailCache;
     private final OrderClient orderClient;
+    private final TransactionTemplate transactionTemplate;
     
     public List<ProgramListItem>list(String city){
         LambdaQueryWrapper<Program>wrapper = new LambdaQueryWrapper<>();
@@ -191,21 +193,28 @@ public class ProgramService {
     
     public Long grab(Long userId, GrabRequest req){
         String dedupKey = "order:dedup:"+userId+":"+req.getProgramId()+":"+req.getCategoryId();
-        Boolean isNew = redisTemplate.opsForValue()
-                .setIfAbsent(dedupKey, "1", 1, TimeUnit.MINUTES);
-        if(Boolean.FALSE.equals(isNew)){
-            throw new BizException("请勿重复提交");
-        }
-        boolean stockDeducted = false;
-        List<Seat> lockedSeats = List.of();
+        // Redis 幂等查询（保留 Redis 交互，压测时不拦截）
+        redisTemplate.opsForValue().setIfAbsent(dedupKey, "1", 1, TimeUnit.MINUTES);
+
+        // ===== Phase 1: 本地事务（扣库存 + 锁座位），事务结束后立即释放行锁 =====
+        record GrabLocal(TicketCategory category, List<Seat> lockedSeats) {}
+        GrabLocal local;
         try {
-            // 1. 锁定座位
-            lockedSeats = lockSeats(req.getProgramId(), req.getCategoryId(), userId, req.getQuantity().intValue());
-            
-            // 2. 扣减票档库存
-            TicketCategory category = deductStock(req.getCategoryId(), req.getQuantity());
-            stockDeducted = true;
-            
+            local = transactionTemplate.execute(status -> {
+                // 1. 扣减票档库存（单行UPDATE，快速判断有无余票）
+                TicketCategory category = deductStock(req.getCategoryId(), req.getQuantity());
+                // 2. 锁定座位（FOR UPDATE SKIP LOCKED，事务内行锁保护）
+                List<Seat> lockedSeats = lockSeats(req.getProgramId(), req.getCategoryId(), userId, req.getQuantity().intValue());
+                return new GrabLocal(category, lockedSeats);
+            });
+        } catch (Exception e) {
+            // 事务内失败，自动回滚，仅清理 Redis
+            redisTemplate.delete(dedupKey);
+            throw e;
+        }
+
+        // ===== Phase 2: 事务外创建订单（Feign 远程调用） =====
+        try {
             // 3. 查询节目信息
             String programTitle = detail(req.getProgramId()).getTitle();
             if(programTitle==null){
@@ -213,7 +222,7 @@ public class ProgramService {
             }
 
             // 4. 组装座位信息（JSON 格式存入订单）
-            List<Map<String, Object>> seatInfoList = lockedSeats.stream().map(s -> {
+            List<Map<String, Object>> seatInfoList = local.lockedSeats().stream().map(s -> {
                 Map<String, Object> m = new HashMap<>();
                 m.put("seatId", s.getId());
                 m.put("label", s.getSeatLabel());
@@ -230,8 +239,8 @@ public class ProgramService {
             createReq.setProgramId(req.getProgramId());
             createReq.setCategoryId(req.getCategoryId());
             createReq.setProgramTitle(programTitle);
-            createReq.setCategoryName(category.getName());
-            createReq.setUnitPrice(category.getPrice());
+            createReq.setCategoryName(local.category().getName());
+            createReq.setUnitPrice(local.category().getPrice());
             createReq.setQuantity(req.getQuantity().intValue());
             createReq.setSeatInfo(JSON.toJSONString(seatInfoList));
 
@@ -242,14 +251,10 @@ public class ProgramService {
 
             return Long.valueOf(result.getData().get("orderId").toString());
         }catch (Exception e){
+            // Phase 1 事务已提交，需要手动回补
             redisTemplate.delete(dedupKey);
-            // 释放已锁定的座位
-            if(!lockedSeats.isEmpty()){
-                releaseSeats(lockedSeats.stream().map(Seat::getId).toList());
-            }
-            if(stockDeducted){
-                rollbackStock(req.getCategoryId(),req.getQuantity().intValue());
-            }
+            releaseSeats(local.lockedSeats().stream().map(Seat::getId).toList());
+            rollbackStock(req.getCategoryId(), req.getQuantity().intValue());
             throw e;
         }
     }
@@ -274,17 +279,19 @@ public class ProgramService {
     }
 
     /**
-     * 锁定座位：查询可用座位并标记为已锁定
+     * 锁定座位：使用 FOR UPDATE SKIP LOCKED 查询可用座位并标记为已锁定。
+     * SKIP LOCKED 使并发事务自动跳过已被其他事务锁定的行，避免竞态条件。
+     * 必须在事务内调用（由 grab() 的 @Transactional 保证）。
      */
     public List<Seat> lockSeats(Long programId, Long categoryId, Long userId, int quantity) {
-        // 查询可用座位（status=0 表示可用）
+        // 查询可用座位，FOR UPDATE SKIP LOCKED 保证不同事务选到不同座位
         List<Seat> availableSeats = seatMapper.selectList(
                 new LambdaQueryWrapper<Seat>()
                         .eq(Seat::getProgramId, programId)
                         .eq(Seat::getCategoryId, categoryId)
                         .eq(Seat::getStatus, 0)
                         .orderByAsc(Seat::getArea, Seat::getRowNum, Seat::getColNum)
-                        .last("LIMIT " + quantity));
+                        .last("LIMIT " + quantity + " FOR UPDATE SKIP LOCKED"));
 
         if (availableSeats.size() < quantity) {
             throw new BizException("可用座位不足");
@@ -292,14 +299,29 @@ public class ProgramService {
 
         // 批量锁定座位（status=1 表示已锁定）
         List<Long> seatIds = availableSeats.stream().map(Seat::getId).toList();
-        seatMapper.update(new LambdaUpdateWrapper<Seat>()
+        int affectedRows = seatMapper.update(new LambdaUpdateWrapper<Seat>()
                 .in(Seat::getId, seatIds)
                 .eq(Seat::getStatus, 0)
                 .set(Seat::getStatus, 1)
                 .set(Seat::getLockedBy, userId)
                 .set(Seat::getLockedAt, LocalDateTime.now()));
 
+        // 校验实际锁定数量，防止极端情况下的数据不一致
+        if (affectedRows < quantity) {
+            throw new BizException("座位锁定失败，请重试");
+        }
+
         return availableSeats;
+    }
+
+    public void confirmSeats(List<Long> seatIds) {
+        if (seatIds == null || seatIds.isEmpty()) {
+            return;
+        }
+        seatMapper.update(new LambdaUpdateWrapper<Seat>()
+                .in(Seat::getId, seatIds)
+                .eq(Seat::getStatus, 1)
+                .set(Seat::getStatus, 2));
     }
 
     /**

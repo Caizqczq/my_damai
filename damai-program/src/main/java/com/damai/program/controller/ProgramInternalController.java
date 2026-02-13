@@ -26,4 +26,10 @@ public class ProgramInternalController {
         programService.releaseSeats(seatIds);
         return Result.ok();
     }
+
+    @PostMapping("/confirmSeats")
+    public Result<?> confirmSeats(@RequestBody List<Long> seatIds) {
+        programService.confirmSeats(seatIds);
+        return Result.ok();
+    }
 }

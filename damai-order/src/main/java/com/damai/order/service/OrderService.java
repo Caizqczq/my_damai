@@ -67,6 +67,16 @@ public class OrderService {
         order.setStatus(1);
         order.setPayTime(LocalDateTime.now());
         orderMapper.updateById(order);
+
+        // 支付成功后，将座位状态从锁定(1)改为已售出(2)
+        try {
+            List<Long> seatIds = parseSeatIds(order.getSeatInfo());
+            if (!seatIds.isEmpty()) {
+                programClient.confirmSeats(seatIds);
+            }
+        } catch (Exception e) {
+            log.error("支付成功但确认座位失败, orderId={}, 需人工处理", orderId, e);
+        }
     }
 
     public void cancel(Long orderId) {
@@ -88,6 +98,40 @@ public class OrderService {
         } catch (Exception e) {
             log.error("回滚库存/释放座位失败, orderId={}", orderId, e);
         }
+    }
+
+    /**
+     * 扫描并取消超时未支付的订单，释放座位并回补库存。
+     * 由定时任务调用。
+     */
+    public int cancelExpiredOrders() {
+        // 查询已过期且仍为待支付的订单，每次处理一批
+        List<TicketOrder> expiredOrders = orderMapper.selectList(
+                new LambdaQueryWrapper<TicketOrder>()
+                        .eq(TicketOrder::getStatus, 0)
+                        .lt(TicketOrder::getExpireTime, LocalDateTime.now())
+                        .last("LIMIT 100"));
+
+        int count = 0;
+        for (TicketOrder order : expiredOrders) {
+            try {
+                // 更新订单状态为已取消
+                order.setStatus(2);
+                order.setCancelTime(LocalDateTime.now());
+                orderMapper.updateById(order);
+
+                // 释放座位 + 回补库存
+                programClient.rollbackStock(order.getCategoryId(), order.getQuantity());
+                List<Long> seatIds = parseSeatIds(order.getSeatInfo());
+                if (!seatIds.isEmpty()) {
+                    programClient.releaseSeats(seatIds);
+                }
+                count++;
+            } catch (Exception e) {
+                log.error("自动取消超时订单失败, orderId={}", order.getId(), e);
+            }
+        }
+        return count;
     }
 
     /**

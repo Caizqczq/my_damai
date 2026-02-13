@@ -17,4 +17,7 @@ public interface ProgramClient {
 
     @PostMapping("/releaseSeats")
     Result<?> releaseSeats(@RequestBody List<Long> seatIds);
+
+    @PostMapping("/confirmSeats")
+    Result<?> confirmSeats(@RequestBody List<Long> seatIds);
 }

@@ -3,10 +3,9 @@ package com.damai.program.controller;
 import com.damai.common.result.Result;
 import com.damai.program.service.ProgramService;
 import lombok.RequiredArgsConstructor;
-import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.RequestMapping;
-import org.springframework.web.bind.annotation.RequestParam;
-import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.List;
 
 @RestController
 @RequestMapping("/api/program/internal")
@@ -19,6 +18,12 @@ public class ProgramInternalController {
     public Result<?> rollbackStock(@RequestParam("categoryId") Long categoryId,
                                    @RequestParam("quantity") Integer quantity) {
         programService.rollbackStock(categoryId, quantity);
+        return Result.ok();
+    }
+
+    @PostMapping("/releaseSeats")
+    public Result<?> releaseSeats(@RequestBody List<Long> seatIds) {
+        programService.releaseSeats(seatIds);
         return Result.ok();
     }
 }

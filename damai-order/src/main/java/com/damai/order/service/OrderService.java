@@ -1,5 +1,8 @@
 package com.damai.order.service;
 
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.damai.common.exception.BizException;
 import com.damai.order.client.ProgramClient;
@@ -12,6 +15,7 @@ import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.List;
 
 @Slf4j
@@ -31,6 +35,7 @@ public class OrderService {
         order.setUnitPrice(req.getUnitPrice());
         order.setQuantity(req.getQuantity());
         order.setTotalAmount(req.getUnitPrice().multiply(BigDecimal.valueOf(req.getQuantity())));
+        order.setSeatInfo(req.getSeatInfo());
         order.setStatus(0);
         order.setExpireTime(LocalDateTime.now().plusMinutes(15));
         orderMapper.insert(order);
@@ -73,9 +78,36 @@ public class OrderService {
         orderMapper.updateById(order);
         
         try {
+            // 回滚票档库存
             programClient.rollbackStock(order.getCategoryId(), order.getQuantity());
+            // 释放座位
+            List<Long> seatIds = parseSeatIds(order.getSeatInfo());
+            if (!seatIds.isEmpty()) {
+                programClient.releaseSeats(seatIds);
+            }
         } catch (Exception e) {
-            log.error("回滚库存失败, orderId={}", orderId, e);
+            log.error("回滚库存/释放座位失败, orderId={}", orderId, e);
+        }
+    }
+
+    /**
+     * 从订单的 seatInfo JSON 中解析出座位ID列表
+     */
+    private List<Long> parseSeatIds(String seatInfo) {
+        if (seatInfo == null || seatInfo.isBlank()) {
+            return List.of();
+        }
+        try {
+            JSONArray array = JSON.parseArray(seatInfo);
+            List<Long> ids = new ArrayList<>();
+            for (int i = 0; i < array.size(); i++) {
+                JSONObject obj = array.getJSONObject(i);
+                ids.add(obj.getLong("seatId"));
+            }
+            return ids;
+        } catch (Exception e) {
+            log.error("解析seatInfo失败: {}", seatInfo, e);
+            return List.of();
         }
     }
 

@@ -13,4 +13,5 @@ public class OrderCreateRequest {
     private String categoryName;
     private BigDecimal unitPrice;
     private Integer quantity;
+    private String seatInfo;
 }

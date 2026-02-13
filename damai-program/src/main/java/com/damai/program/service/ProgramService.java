@@ -24,6 +24,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -196,14 +197,34 @@ public class ProgramService {
             throw new BizException("请勿重复提交");
         }
         boolean stockDeducted = false;
+        List<Seat> lockedSeats = List.of();
         try {
-            TicketCategory category = deductStock(req.getCategoryId(),req.getQuantity());
+            // 1. 锁定座位
+            lockedSeats = lockSeats(req.getProgramId(), req.getCategoryId(), userId, req.getQuantity().intValue());
+            
+            // 2. 扣减票档库存
+            TicketCategory category = deductStock(req.getCategoryId(), req.getQuantity());
             stockDeducted = true;
+            
+            // 3. 查询节目信息
             String programTitle = detail(req.getProgramId()).getTitle();
             if(programTitle==null){
                 throw new BizException("节目不存在");
             }
 
+            // 4. 组装座位信息（JSON 格式存入订单）
+            List<Map<String, Object>> seatInfoList = lockedSeats.stream().map(s -> {
+                Map<String, Object> m = new HashMap<>();
+                m.put("seatId", s.getId());
+                m.put("label", s.getSeatLabel());
+                m.put("area", s.getArea());
+                m.put("row", s.getRowNum());
+                m.put("col", s.getColNum());
+                m.put("price", s.getPrice());
+                return m;
+            }).toList();
+
+            // 5. 创建订单
             OrderCreateRequest createReq = new OrderCreateRequest();
             createReq.setUserId(userId);
             createReq.setProgramId(req.getProgramId());
@@ -212,6 +233,7 @@ public class ProgramService {
             createReq.setCategoryName(category.getName());
             createReq.setUnitPrice(category.getPrice());
             createReq.setQuantity(req.getQuantity().intValue());
+            createReq.setSeatInfo(JSON.toJSONString(seatInfoList));
 
             Result<Map<String, Object>> result = orderClient.createOrder(createReq);
             if (result == null || result.getCode() != 200) {
@@ -221,6 +243,10 @@ public class ProgramService {
             return Long.valueOf(result.getData().get("orderId").toString());
         }catch (Exception e){
             redisTemplate.delete(dedupKey);
+            // 释放已锁定的座位
+            if(!lockedSeats.isEmpty()){
+                releaseSeats(lockedSeats.stream().map(Seat::getId).toList());
+            }
             if(stockDeducted){
                 rollbackStock(req.getCategoryId(),req.getQuantity().intValue());
             }
@@ -246,6 +272,47 @@ public class ProgramService {
                 .setSql("available_stock = available_stock + " + quantity);
         categoryMapper.update(wrapper);
     }
-    
-    
+
+    /**
+     * 锁定座位：查询可用座位并标记为已锁定
+     */
+    public List<Seat> lockSeats(Long programId, Long categoryId, Long userId, int quantity) {
+        // 查询可用座位（status=0 表示可用）
+        List<Seat> availableSeats = seatMapper.selectList(
+                new LambdaQueryWrapper<Seat>()
+                        .eq(Seat::getProgramId, programId)
+                        .eq(Seat::getCategoryId, categoryId)
+                        .eq(Seat::getStatus, 0)
+                        .orderByAsc(Seat::getArea, Seat::getRowNum, Seat::getColNum)
+                        .last("LIMIT " + quantity));
+
+        if (availableSeats.size() < quantity) {
+            throw new BizException("可用座位不足");
+        }
+
+        // 批量锁定座位（status=1 表示已锁定）
+        List<Long> seatIds = availableSeats.stream().map(Seat::getId).toList();
+        seatMapper.update(new LambdaUpdateWrapper<Seat>()
+                .in(Seat::getId, seatIds)
+                .eq(Seat::getStatus, 0)
+                .set(Seat::getStatus, 1)
+                .set(Seat::getLockedBy, userId)
+                .set(Seat::getLockedAt, LocalDateTime.now()));
+
+        return availableSeats;
+    }
+
+    /**
+     * 释放座位：将已锁定的座位恢复为可用
+     */
+    public void releaseSeats(List<Long> seatIds) {
+        if (seatIds == null || seatIds.isEmpty()) {
+            return;
+        }
+        seatMapper.update(new LambdaUpdateWrapper<Seat>()
+                .in(Seat::getId, seatIds)
+                .set(Seat::getStatus, 0)
+                .set(Seat::getLockedBy, null)
+                .set(Seat::getLockedAt, null));
+    }
 }

@@ -1,43 +1,48 @@
 package com.damai.order.controller;
 
 import com.damai.common.result.Result;
+import com.damai.order.dto.OrderCreateRequest;
+import com.damai.order.service.OrderService;
+import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/order")
+@RequiredArgsConstructor
 public class OrderController {
 
-    // TODO: 注入 OrderService
+    private final OrderService orderService;
 
-    @PostMapping("/token")
-    public Result<?> getToken(@RequestHeader("X-User-Id") Long userId,
-                              @RequestParam Long programId) {
-        // TODO: 生成抢票幂等Token
-        return Result.ok();
+    /**
+     * 内部接口：供 program 服务调用创建订单
+     */
+    @PostMapping("/internal/create")
+    public Result<?> create(@RequestBody OrderCreateRequest createRequest) {
+        Long orderId = orderService.create(createRequest);
+        return Result.ok(Map.of("orderId",orderId));
     }
 
-    @PostMapping("/grab")
-    public Result<?> grab(@RequestHeader("X-User-Id") Long userId,
-                          @RequestBody Object grabRequest) {
-        // TODO: 抢票核心逻辑（Redis Lua预扣减 + MQ异步下单）
-        return Result.ok();
+    @GetMapping("/my")
+    public Result<?> myOrders(@RequestHeader("X-User-Id") Long userId) {
+        return Result.ok(orderService.listByUserId(userId));
     }
 
     @GetMapping("/{orderId}")
     public Result<?> detail(@PathVariable Long orderId) {
-        // TODO: 查询订单详情
-        return Result.ok();
+        return Result.ok(orderService.detail(orderId));
     }
 
     @PostMapping("/{orderId}/pay")
     public Result<?> pay(@PathVariable Long orderId) {
-        // TODO: 模拟支付
+        orderService.pay(orderId);
         return Result.ok();
     }
 
     @PostMapping("/{orderId}/cancel")
     public Result<?> cancel(@PathVariable Long orderId) {
-        // TODO: 取消订单，回滚库存
+        orderService.cancel(orderId);
         return Result.ok();
     }
 }

@@ -2,12 +2,12 @@ package com.damai.program.service;
 
 import com.alibaba.fastjson.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.damai.common.constant.RedisKeyConstant;
 import com.damai.common.exception.BizException;
-import com.damai.program.dto.ProgramDetailDTO;
-import com.damai.program.dto.ProgramListItem;
-import com.damai.program.dto.SeatDTO;
-import com.damai.program.dto.StockDTO;
+import com.damai.common.result.Result;
+import com.damai.program.client.OrderClient;
+import com.damai.program.dto.*;
 import com.damai.program.entity.Program;
 import com.damai.program.entity.Seat;
 import com.damai.program.entity.TicketCategory;
@@ -16,11 +16,16 @@ import com.damai.program.mapper.SeatMapper;
 import com.damai.program.mapper.TicketCategoryMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import lombok.RequiredArgsConstructor;
+import org.springframework.core.ParameterizedTypeReference;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.http.HttpMethod;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +39,7 @@ public class ProgramService {
     private final SeatMapper seatMapper;
     private final StringRedisTemplate redisTemplate;
     private final Cache<Long,ProgramDetailDTO> programDetailCache;
+    private final OrderClient orderClient;
     
     public List<ProgramListItem>list(String city){
         LambdaQueryWrapper<Program>wrapper = new LambdaQueryWrapper<>();
@@ -80,17 +86,20 @@ public class ProgramService {
     
     
     public ProgramDetailDTO detail(Long id){
+        //本地缓存
         ProgramDetailDTO localDto = programDetailCache.getIfPresent(id);
         if (localDto != null) {
             return localDto;
         }
         String cacheKey= RedisKeyConstant.PROGRAM_DETAIL+id;
+        //redis 缓存
         String cache = redisTemplate.opsForValue().get(cacheKey);
         if(cache!=null){
             ProgramDetailDTO dto = JSON.parseObject(cache, ProgramDetailDTO.class);
             programDetailCache.put(id,dto);
             return dto;
         }
+        //查数据库
         Program program = programMapper.selectById(id);
         if (program == null) {
             throw new BizException(1001, "节目不存在");
@@ -100,6 +109,7 @@ public class ProgramService {
                 new LambdaQueryWrapper<TicketCategory>()
                         .eq(TicketCategory::getProgramId, id));
 
+        //组装数据
         ProgramDetailDTO dto = new ProgramDetailDTO();
         dto.setId(program.getId());
         dto.setTitle(program.getTitle());
@@ -117,8 +127,10 @@ public class ProgramService {
             cd.setPrice(c.getPrice());
             return cd;
         }).toList());
+        //回填缓存
         redisTemplate.opsForValue().set(cacheKey, JSON.toJSONString(dto), 10, TimeUnit.MINUTES);
         programDetailCache.put(id, dto);
+        
         return dto;
     }
     
@@ -174,4 +186,66 @@ public class ProgramService {
             return dto;
         }).toList();
     }
+    
+    
+    public Long grab(Long userId, GrabRequest req){
+        String dedupKey = "order:dedup:"+userId+":"+req.getProgramId()+":"+req.getCategoryId();
+        Boolean isNew = redisTemplate.opsForValue()
+                .setIfAbsent(dedupKey, "1", 1, TimeUnit.MINUTES);
+        if(Boolean.FALSE.equals(isNew)){
+            throw new BizException("请勿重复提交");
+        }
+        boolean stockDeducted = false;
+        try {
+            TicketCategory category = deductStock(req.getCategoryId(),req.getQuantity());
+            stockDeducted = true;
+            String programTitle = detail(req.getProgramId()).getTitle();
+            if(programTitle==null){
+                throw new BizException("节目不存在");
+            }
+
+            OrderCreateRequest createReq = new OrderCreateRequest();
+            createReq.setUserId(userId);
+            createReq.setProgramId(req.getProgramId());
+            createReq.setCategoryId(req.getCategoryId());
+            createReq.setProgramTitle(programTitle);
+            createReq.setCategoryName(category.getName());
+            createReq.setUnitPrice(category.getPrice());
+            createReq.setQuantity(req.getQuantity().intValue());
+
+            Result<Map<String, Object>> result = orderClient.createOrder(createReq);
+            if (result == null || result.getCode() != 200) {
+                throw new BizException("创建订单失败");
+            }
+
+            return Long.valueOf(result.getData().get("orderId").toString());
+        }catch (Exception e){
+            redisTemplate.delete(dedupKey);
+            if(stockDeducted){
+                rollbackStock(req.getCategoryId(),req.getQuantity().intValue());
+            }
+            throw e;
+        }
+    }
+
+    public TicketCategory deductStock(Long categoryId, long quantity){
+        LambdaUpdateWrapper<TicketCategory> wrapper = new LambdaUpdateWrapper<TicketCategory>()
+                .eq(TicketCategory::getId, categoryId)
+                .ge(TicketCategory::getAvailableStock, quantity)
+                .setSql("available_stock = available_stock - " + quantity);
+        int rows = categoryMapper.update(wrapper);
+        if(rows==0){
+            throw new BizException("库存不足");
+        }
+        return categoryMapper.selectById(categoryId);
+    }
+    
+    public void rollbackStock(Long categoryId, int quantity){
+        LambdaUpdateWrapper<TicketCategory> wrapper = new LambdaUpdateWrapper<TicketCategory>()
+                .eq(TicketCategory::getId, categoryId)
+                .setSql("available_stock = available_stock + " + quantity);
+        categoryMapper.update(wrapper);
+    }
+    
+    
 }

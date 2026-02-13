@@ -19,8 +19,6 @@ public class TicketCategory {
     private BigDecimal price;
     private Integer totalStock;
     private Integer availableStock;
-    @Version
-    private Integer version;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

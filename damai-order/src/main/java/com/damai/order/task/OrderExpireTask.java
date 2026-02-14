@@ -21,7 +21,7 @@ public class OrderExpireTask {
     /**
      * 每30秒扫描一次超时未支付的订单
      */
-    @Scheduled(fixedDelay = 30_0000)
+    @Scheduled(fixedDelay = 30_000)
     public void cancelExpiredOrders() {
         try {
             int count = orderService.cancelExpiredOrders();

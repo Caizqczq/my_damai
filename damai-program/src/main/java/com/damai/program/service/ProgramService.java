@@ -15,9 +15,12 @@ import com.damai.program.mapper.ProgramMapper;
 import com.damai.program.mapper.SeatMapper;
 import com.damai.program.mapper.TicketCategoryMapper;
 import com.github.benmanes.caffeine.cache.Cache;
+import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
 import org.springframework.core.ParameterizedTypeReference;
+import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
@@ -30,6 +33,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -43,6 +47,34 @@ public class ProgramService {
     private final Cache<Long,ProgramDetailDTO> programDetailCache;
     private final OrderClient orderClient;
     private final TransactionTemplate transactionTemplate;
+    
+    private DefaultRedisScript<String>script=new DefaultRedisScript<>();
+    
+    @PostConstruct
+    public void init(){
+        script.setResultType(String.class);
+        script.setLocation(new ClassPathResource("lua/grab_ticket.lua"));
+    }
+    
+    public void initStock(Long programId){
+        List<TicketCategory>cats=categoryMapper.selectList(
+                new LambdaQueryWrapper<TicketCategory>()
+                        .eq(TicketCategory::getProgramId,programId)
+        );
+        Map<String,String> meta = new HashMap<>();
+        for(TicketCategory cat:cats){
+            String stockKey = RedisKeyConstant.PROGRAM_STOCK+programId+":"+cat.getId();
+            redisTemplate.opsForValue().set(stockKey,cat.getAvailableStock().toString());
+            meta.put(cat.getId().toString(), cat.getName());
+        }
+        // 票档元信息：categoryId -> name
+        String metaKey = RedisKeyConstant.PROGRAM_STOCK+programId+":meta";
+        redisTemplate.opsForHash().putAll(metaKey, meta);
+    }
+
+    private void rollbackRedis(String stockKey, int quantity) {
+        redisTemplate.opsForValue().increment(stockKey, quantity);
+    }
     
     public List<ProgramListItem>list(String city){
         LambdaQueryWrapper<Program>wrapper = new LambdaQueryWrapper<>();
@@ -111,7 +143,6 @@ public class ProgramService {
         List<TicketCategory> cats = categoryMapper.selectList(
                 new LambdaQueryWrapper<TicketCategory>()
                         .eq(TicketCategory::getProgramId, id));
-
         //组装数据
         ProgramDetailDTO dto = new ProgramDetailDTO();
         dto.setId(program.getId());
@@ -138,22 +169,46 @@ public class ProgramService {
     }
     
     public StockDTO stock(Long programId){
-        List<TicketCategory>cats=categoryMapper.selectList(
-                new LambdaQueryWrapper<TicketCategory>()
-                        .eq(TicketCategory::getProgramId,programId)
-        );
+        String metaKey = RedisKeyConstant.PROGRAM_STOCK+programId+":meta";
+        Map<Object,Object> meta = redisTemplate.opsForHash().entries(metaKey);
+
+        // 未预热，降级查MySQL
+        if(meta.isEmpty()){
+            List<TicketCategory>cats=categoryMapper.selectList(
+                    new LambdaQueryWrapper<TicketCategory>()
+                            .eq(TicketCategory::getProgramId,programId)
+            );
+            StockDTO stockDTO=new StockDTO();
+            stockDTO.setId(programId);
+            stockDTO.setCategories(cats.stream().map(c->{
+                StockDTO.CategoryStock cs = new StockDTO.CategoryStock();
+                cs.setCategoryId(c.getId());
+                cs.setName(c.getName());
+                cs.setAvailable(c.getAvailableStock());
+                return cs;
+            }).toList());
+            stockDTO.setTotalAvailable(cats.stream().mapToInt(TicketCategory::getAvailableStock).sum());
+            return stockDTO;
+        }
+
+        // 已预热，完全从Redis读
         StockDTO stockDTO=new StockDTO();
         stockDTO.setId(programId);
-        stockDTO.setCategories(
-                cats.stream().map(c->{
-                    StockDTO.CategoryStock cs = new StockDTO.CategoryStock();
-                    cs.setCategoryId(c.getId());
-                    cs.setName(c.getName());
-                    cs.setAvailable(c.getAvailableStock());
-                    return cs;
-                }).toList()
-        ); 
-        stockDTO.setTotalAvailable(cats.stream().mapToInt(TicketCategory::getAvailableStock).sum());
+        List<StockDTO.CategoryStock> categories = new ArrayList<>();
+        for(Map.Entry<Object,Object> entry : meta.entrySet()){
+            Long categoryId = Long.parseLong(entry.getKey().toString());
+            String name = entry.getValue().toString();
+            String stockKey = RedisKeyConstant.PROGRAM_STOCK+programId+":"+categoryId;
+            String val = redisTemplate.opsForValue().get(stockKey);
+
+            StockDTO.CategoryStock cs = new StockDTO.CategoryStock();
+            cs.setCategoryId(categoryId);
+            cs.setName(name);
+            cs.setAvailable(val != null ? Integer.parseInt(val) : 0);
+            categories.add(cs);
+        }
+        stockDTO.setCategories(categories);
+        stockDTO.setTotalAvailable(categories.stream().mapToInt(StockDTO.CategoryStock::getAvailable).sum());
         return stockDTO;
     }
     
@@ -196,33 +251,36 @@ public class ProgramService {
         // Redis 幂等查询（保留 Redis 交互，压测时不拦截）
         redisTemplate.opsForValue().setIfAbsent(dedupKey, "1", 1, TimeUnit.MINUTES);
 
-        // ===== Phase 1: 本地事务（扣库存 + 锁座位），事务结束后立即释放行锁 =====
-        record GrabLocal(TicketCategory category, List<Seat> lockedSeats) {}
-        GrabLocal local;
+        String stockKey = RedisKeyConstant.PROGRAM_STOCK + req.getProgramId() + ":" + req.getCategoryId();
+        String luaResult = redisTemplate.execute(script,List.of(stockKey),String.valueOf(req.getQuantity()));
+        if("-1".equals(luaResult)){
+            throw new BizException("库存不足");
+        }
+
+        // 从缓存获取节目和票档信息（本地缓存 + Redis缓存，不打数据库）
+        ProgramDetailDTO programDetail = detail(req.getProgramId());
+        ProgramDetailDTO.CategoryDTO categoryDTO = programDetail.getCategories().stream()
+                .filter(c -> c.getId().equals(req.getCategoryId()))
+                .findFirst()
+                .orElseThrow(() -> new BizException("票档不存在"));
+
+        // ===== Phase 1: 本地事务（仅锁座位），库存已由Redis保证 =====
+        List<Seat> lockedSeats;
         try {
-            local = transactionTemplate.execute(status -> {
-                // 1. 扣减票档库存（单行UPDATE，快速判断有无余票）
-                TicketCategory category = deductStock(req.getCategoryId(), req.getQuantity());
-                // 2. 锁定座位（FOR UPDATE SKIP LOCKED，事务内行锁保护）
-                List<Seat> lockedSeats = lockSeats(req.getProgramId(), req.getCategoryId(), userId, req.getQuantity().intValue());
-                return new GrabLocal(category, lockedSeats);
-            });
+            lockedSeats = transactionTemplate.execute(status ->
+                lockSeats(req.getProgramId(), req.getCategoryId(), userId, req.getQuantity().intValue())
+            );
         } catch (Exception e) {
-            // 事务内失败，自动回滚，仅清理 Redis
+            // 事务内失败，自动回滚，回补Redis
             redisTemplate.delete(dedupKey);
+            rollbackRedis(stockKey, req.getQuantity().intValue());
             throw e;
         }
 
         // ===== Phase 2: 事务外创建订单（Feign 远程调用） =====
         try {
-            // 3. 查询节目信息
-            String programTitle = detail(req.getProgramId()).getTitle();
-            if(programTitle==null){
-                throw new BizException("节目不存在");
-            }
-
-            // 4. 组装座位信息（JSON 格式存入订单）
-            List<Map<String, Object>> seatInfoList = local.lockedSeats().stream().map(s -> {
+            // 组装座位信息（JSON 格式存入订单）
+            List<Map<String, Object>> seatInfoList = lockedSeats.stream().map(s -> {
                 Map<String, Object> m = new HashMap<>();
                 m.put("seatId", s.getId());
                 m.put("label", s.getSeatLabel());
@@ -233,14 +291,14 @@ public class ProgramService {
                 return m;
             }).toList();
 
-            // 5. 创建订单
+            // 创建订单
             OrderCreateRequest createReq = new OrderCreateRequest();
             createReq.setUserId(userId);
             createReq.setProgramId(req.getProgramId());
             createReq.setCategoryId(req.getCategoryId());
-            createReq.setProgramTitle(programTitle);
-            createReq.setCategoryName(local.category().getName());
-            createReq.setUnitPrice(local.category().getPrice());
+            createReq.setProgramTitle(programDetail.getTitle());
+            createReq.setCategoryName(categoryDTO.getName());
+            createReq.setUnitPrice(categoryDTO.getPrice());
             createReq.setQuantity(req.getQuantity().intValue());
             createReq.setSeatInfo(JSON.toJSONString(seatInfoList));
 
@@ -249,12 +307,17 @@ public class ProgramService {
                 throw new BizException("创建订单失败");
             }
 
+            // 订单创建成功，异步回写MySQL库存（不阻塞主流程）
+            Long categoryId = req.getCategoryId();
+            long quantity = req.getQuantity();
+            CompletableFuture.runAsync(() -> deductStock(categoryId, quantity));
+
             return Long.valueOf(result.getData().get("orderId").toString());
         }catch (Exception e){
-            // Phase 1 事务已提交，需要手动回补
+            // Phase 1 事务已提交，回补Redis+释放座位（MySQL库存未扣，无需rollbackStock）
             redisTemplate.delete(dedupKey);
-            releaseSeats(local.lockedSeats().stream().map(Seat::getId).toList());
-            rollbackStock(req.getCategoryId(), req.getQuantity().intValue());
+            rollbackRedis(stockKey, req.getQuantity().intValue());
+            releaseSeats(lockedSeats.stream().map(Seat::getId).toList());
             throw e;
         }
     }
@@ -272,10 +335,18 @@ public class ProgramService {
     }
     
     public void rollbackStock(Long categoryId, int quantity){
+        // 回补 MySQL 库存
         LambdaUpdateWrapper<TicketCategory> wrapper = new LambdaUpdateWrapper<TicketCategory>()
                 .eq(TicketCategory::getId, categoryId)
                 .setSql("available_stock = available_stock + " + quantity);
         categoryMapper.update(wrapper);
+
+        // 回补 Redis 库存（取消/超时场景）
+        TicketCategory cat = categoryMapper.selectById(categoryId);
+        if (cat != null) {
+            String stockKey = RedisKeyConstant.PROGRAM_STOCK + cat.getProgramId() + ":" + categoryId;
+            redisTemplate.opsForValue().increment(stockKey, quantity);
+        }
     }
 
     /**

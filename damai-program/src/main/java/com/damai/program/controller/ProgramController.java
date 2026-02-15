@@ -47,4 +47,10 @@ public class ProgramController {
         Long orderId = programService.grab(userId,grabRequest);
         return Result.ok(Map.of("orderId",orderId));
     }
+
+    @PostMapping("/{id}/init-stock")
+    public Result<?> initStock(@PathVariable Long id) {
+        programService.initStock(id);
+        return Result.ok("库存预热完成");
+    }
 }

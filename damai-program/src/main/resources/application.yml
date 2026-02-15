@@ -38,6 +38,10 @@ spring:
       port: 6379
       password: 123456
 
+damai:
+  seat:
+    strategy: redis  # redis(V3) 或 database(V2)
+
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml
   configuration:

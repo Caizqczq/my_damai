@@ -14,22 +14,19 @@ public class ProgramInternalController {
 
     private final ProgramService programService;
 
-    @PostMapping("/rollbackStock")
-    public Result<?> rollbackStock(@RequestParam("categoryId") Long categoryId,
-                                   @RequestParam("quantity") Integer quantity) {
-        programService.rollbackStock(categoryId, quantity);
-        return Result.ok();
-    }
-
     @PostMapping("/releaseSeats")
-    public Result<?> releaseSeats(@RequestBody List<Long> seatIds) {
-        programService.releaseSeats(seatIds);
+    public Result<?> releaseSeats(@RequestParam("programId") Long programId,
+                                  @RequestParam("categoryId") Long categoryId,
+                                  @RequestBody List<Long> seatIds) {
+        programService.releaseSeats(programId, categoryId, seatIds);
         return Result.ok();
     }
 
     @PostMapping("/confirmSeats")
-    public Result<?> confirmSeats(@RequestBody List<Long> seatIds) {
-        programService.confirmSeats(seatIds);
+    public Result<?> confirmSeats(@RequestParam("programId") Long programId,
+                                  @RequestParam("categoryId") Long categoryId,
+                                  @RequestBody List<Long> seatIds) {
+        programService.confirmSeats(programId, categoryId, seatIds);
         return Result.ok();
     }
 }

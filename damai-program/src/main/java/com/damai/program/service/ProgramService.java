@@ -2,7 +2,6 @@ package com.damai.program.service;
 
 import com.alibaba.fastjson.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
-import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.damai.common.constant.RedisKeyConstant;
 import com.damai.common.exception.BizException;
 import com.damai.common.result.Result;
@@ -14,26 +13,18 @@ import com.damai.program.entity.TicketCategory;
 import com.damai.program.mapper.ProgramMapper;
 import com.damai.program.mapper.SeatMapper;
 import com.damai.program.mapper.TicketCategoryMapper;
+import com.damai.program.strategy.GrabResult;
+import com.damai.program.strategy.SeatStrategy;
 import com.github.benmanes.caffeine.cache.Cache;
-import jakarta.annotation.PostConstruct;
 import lombok.RequiredArgsConstructor;
-import org.springframework.core.ParameterizedTypeReference;
-import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.data.redis.core.script.DefaultRedisScript;
-import org.springframework.http.HttpMethod;
-import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
-import org.springframework.transaction.support.TransactionTemplate;
-import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
-import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -46,16 +37,8 @@ public class ProgramService {
     private final StringRedisTemplate redisTemplate;
     private final Cache<Long,ProgramDetailDTO> programDetailCache;
     private final OrderClient orderClient;
-    private final TransactionTemplate transactionTemplate;
-    
-    private DefaultRedisScript<String>script=new DefaultRedisScript<>();
-    
-    @PostConstruct
-    public void init(){
-        script.setResultType(String.class);
-        script.setLocation(new ClassPathResource("lua/grab_ticket.lua"));
-    }
-    
+    private final SeatStrategy seatStrategy;
+
     public void initStock(Long programId){
         List<TicketCategory>cats=categoryMapper.selectList(
                 new LambdaQueryWrapper<TicketCategory>()
@@ -66,28 +49,72 @@ public class ProgramService {
             String stockKey = RedisKeyConstant.PROGRAM_STOCK+programId+":"+cat.getId();
             redisTemplate.opsForValue().set(stockKey,cat.getAvailableStock().toString());
             meta.put(cat.getId().toString(), cat.getName());
+
+            // ===== 座位数据预热到 Redis =====
+            String availKey  = RedisKeyConstant.SEAT_AVAIL + programId + ":" + cat.getId();
+            String lockedKey = RedisKeyConstant.SEAT_LOCKED + programId + ":" + cat.getId();
+            String seatMetaKey = RedisKeyConstant.SEAT_META + programId + ":" + cat.getId();
+            String soldKey   = RedisKeyConstant.SEAT_SOLD + programId + ":" + cat.getId();
+
+            // 清除旧数据，保证幂等（可重复调用 initStock）
+            redisTemplate.delete(List.of(availKey, lockedKey, seatMetaKey, soldKey));
+
+            // 查询该票档下所有座位（按 area、row、col 排序）
+            List<Seat> seats = seatMapper.selectList(
+                    new LambdaQueryWrapper<Seat>()
+                            .eq(Seat::getProgramId, programId)
+                            .eq(Seat::getCategoryId, cat.getId())
+                            .orderByAsc(Seat::getArea, Seat::getRowNum, Seat::getColNum));
+
+            Map<String, String> seatMetaBatch = new HashMap<>();
+            for (int i = 0; i < seats.size(); i++) {
+                Seat seat = seats.get(i);
+                String seatId = seat.getId().toString();
+                double score = i; // 索引即排序权重，与 DB 排序一致
+
+                switch (seat.getStatus()) {
+                    case 0 -> // 可用 → Sorted Set
+                            redisTemplate.opsForZSet().add(availKey, seatId, score);
+                    case 1 -> { // 已锁定 → Hash（value = userId:timestamp:score）
+                        String lockInfo = seat.getLockedBy() + ":"
+                                + System.currentTimeMillis() + ":" + i;
+                        redisTemplate.opsForHash().put(lockedKey, seatId, lockInfo);
+                    }
+                    case 2 -> // 已售出 → Set
+                            redisTemplate.opsForSet().add(soldKey, seatId);
+                }
+
+                // 座位元数据（静态信息，供 grab 后组装订单用）
+                Map<String, Object> seatInfo = new HashMap<>();
+                seatInfo.put("area", seat.getArea());
+                seatInfo.put("row", seat.getRowNum());
+                seatInfo.put("col", seat.getColNum());
+                seatInfo.put("label", seat.getSeatLabel());
+                seatInfo.put("price", seat.getPrice().toString());
+                seatMetaBatch.put(seatId, JSON.toJSONString(seatInfo));
+            }
+
+            if (!seatMetaBatch.isEmpty()) {
+                redisTemplate.opsForHash().putAll(seatMetaKey, seatMetaBatch);
+            }
         }
         // 票档元信息：categoryId -> name
         String metaKey = RedisKeyConstant.PROGRAM_STOCK+programId+":meta";
         redisTemplate.opsForHash().putAll(metaKey, meta);
     }
 
-    private void rollbackRedis(String stockKey, int quantity) {
-        redisTemplate.opsForValue().increment(stockKey, quantity);
-    }
-    
     public List<ProgramListItem>list(String city){
         LambdaQueryWrapper<Program>wrapper = new LambdaQueryWrapper<>();
         if(city!=null&&!city.isBlank()){
             wrapper.eq(Program::getCity,city);
         }
         wrapper.orderByAsc(Program::getShowTime);
-        
+
         List<Program> programs = programMapper.selectList(wrapper);
         if(programs.isEmpty()){
             return List.of();
         }
-        
+
         List<Long>programIds = programs.stream().map(Program::getId).toList();
         Map<Long,List<TicketCategory>>categoryMap=categoryMapper.selectList(
                 new LambdaQueryWrapper<TicketCategory>()
@@ -96,7 +123,7 @@ public class ProgramService {
                 .collect(Collectors.groupingBy(TicketCategory::getProgramId));
 
         List<ProgramListItem> result = new ArrayList<>();
-        
+
         for (Program program : programs) {
             ProgramListItem item = new ProgramListItem();
             item.setId(program.getId());
@@ -118,8 +145,8 @@ public class ProgramService {
         }
         return result;
     }
-    
-    
+
+
     public ProgramDetailDTO detail(Long id){
         //本地缓存
         ProgramDetailDTO localDto = programDetailCache.getIfPresent(id);
@@ -164,10 +191,10 @@ public class ProgramService {
         //回填缓存
         redisTemplate.opsForValue().set(cacheKey, JSON.toJSONString(dto), 10, TimeUnit.MINUTES);
         programDetailCache.put(id, dto);
-        
+
         return dto;
     }
-    
+
     public StockDTO stock(Long programId){
         String metaKey = RedisKeyConstant.PROGRAM_STOCK+programId+":meta";
         Map<Object,Object> meta = redisTemplate.opsForHash().entries(metaKey);
@@ -211,7 +238,7 @@ public class ProgramService {
         stockDTO.setTotalAvailable(categories.stream().mapToInt(StockDTO.CategoryStock::getAvailable).sum());
         return stockDTO;
     }
-    
+
     public List<SeatDTO>seats(Long programId,Long categoryId){
         LambdaQueryWrapper<Seat> wrapper = new LambdaQueryWrapper<Seat>()
                 .eq(Seat::getProgramId, programId);
@@ -244,168 +271,72 @@ public class ProgramService {
             return dto;
         }).toList();
     }
-    
-    
+
+
     public Long grab(Long userId, GrabRequest req){
-        String dedupKey = "order:dedup:"+userId+":"+req.getProgramId()+":"+req.getCategoryId();
-        // Redis 幂等查询（保留 Redis 交互，压测时不拦截）
+        Long programId = req.getProgramId();
+        Long categoryId = req.getCategoryId();
+        int quantity = req.getQuantity().intValue();
+
+        String dedupKey = "order:dedup:" + userId + ":" + programId + ":" + categoryId;
         redisTemplate.opsForValue().setIfAbsent(dedupKey, "1", 1, TimeUnit.MINUTES);
 
-        String stockKey = RedisKeyConstant.PROGRAM_STOCK + req.getProgramId() + ":" + req.getCategoryId();
-        String luaResult = redisTemplate.execute(script,List.of(stockKey),String.valueOf(req.getQuantity()));
-        if("-1".equals(luaResult)){
-            throw new BizException("库存不足");
-        }
-
-        // 从缓存获取节目和票档信息（本地缓存 + Redis缓存，不打数据库）
-        ProgramDetailDTO programDetail = detail(req.getProgramId());
-        ProgramDetailDTO.CategoryDTO categoryDTO = programDetail.getCategories().stream()
-                .filter(c -> c.getId().equals(req.getCategoryId()))
-                .findFirst()
-                .orElseThrow(() -> new BizException("票档不存在"));
-
-        // ===== Phase 1: 本地事务（仅锁座位），库存已由Redis保证 =====
-        List<Seat> lockedSeats;
+        // ===== Phase 1: 策略预留（扣库存 + 锁座位） =====
+        GrabResult grabResult;
         try {
-            lockedSeats = transactionTemplate.execute(status ->
-                lockSeats(req.getProgramId(), req.getCategoryId(), userId, req.getQuantity().intValue())
-            );
+            grabResult = seatStrategy.reserve(programId, categoryId, userId, quantity);
         } catch (Exception e) {
-            // 事务内失败，自动回滚，回补Redis
             redisTemplate.delete(dedupKey);
-            rollbackRedis(stockKey, req.getQuantity().intValue());
             throw e;
         }
 
-        // ===== Phase 2: 事务外创建订单（Feign 远程调用） =====
-        try {
-            // 组装座位信息（JSON 格式存入订单）
-            List<Map<String, Object>> seatInfoList = lockedSeats.stream().map(s -> {
-                Map<String, Object> m = new HashMap<>();
-                m.put("seatId", s.getId());
-                m.put("label", s.getSeatLabel());
-                m.put("area", s.getArea());
-                m.put("row", s.getRowNum());
-                m.put("col", s.getColNum());
-                m.put("price", s.getPrice());
-                return m;
-            }).toList();
+        // 从缓存获取节目和票档信息
+        ProgramDetailDTO programDetail = detail(programId);
+        ProgramDetailDTO.CategoryDTO categoryDTO = programDetail.getCategories().stream()
+                .filter(c -> c.getId().equals(categoryId))
+                .findFirst()
+                .orElseThrow(() -> new BizException("票档不存在"));
 
-            // 创建订单
+        // ===== Phase 2: 创建订单（Feign 远程调用） =====
+        try {
             OrderCreateRequest createReq = new OrderCreateRequest();
             createReq.setUserId(userId);
-            createReq.setProgramId(req.getProgramId());
-            createReq.setCategoryId(req.getCategoryId());
+            createReq.setProgramId(programId);
+            createReq.setCategoryId(categoryId);
             createReq.setProgramTitle(programDetail.getTitle());
             createReq.setCategoryName(categoryDTO.getName());
             createReq.setUnitPrice(categoryDTO.getPrice());
-            createReq.setQuantity(req.getQuantity().intValue());
-            createReq.setSeatInfo(JSON.toJSONString(seatInfoList));
+            createReq.setQuantity(quantity);
+            createReq.setSeatInfo(JSON.toJSONString(grabResult.getSeatInfoList()));
 
             Result<Map<String, Object>> result = orderClient.createOrder(createReq);
             if (result == null || result.getCode() != 200) {
                 throw new BizException("创建订单失败");
             }
 
-            // 订单创建成功，异步回写MySQL库存（不阻塞主流程）
-            Long categoryId = req.getCategoryId();
-            long quantity = req.getQuantity();
-            CompletableFuture.runAsync(() -> deductStock(categoryId, quantity));
+            // 订单创建成功，异步回写DB
+            seatStrategy.afterOrderCreated(programId, categoryId, userId, quantity, grabResult.getSeatIds());
 
             return Long.valueOf(result.getData().get("orderId").toString());
-        }catch (Exception e){
-            // Phase 1 事务已提交，回补Redis+释放座位（MySQL库存未扣，无需rollbackStock）
+        } catch (Exception e) {
+            // 订单创建失败，回滚预留资源
             redisTemplate.delete(dedupKey);
-            rollbackRedis(stockKey, req.getQuantity().intValue());
-            releaseSeats(lockedSeats.stream().map(Seat::getId).toList());
+            seatStrategy.rollbackReserve(programId, categoryId, grabResult.getSeatIds());
             throw e;
         }
     }
 
-    public TicketCategory deductStock(Long categoryId, long quantity){
-        LambdaUpdateWrapper<TicketCategory> wrapper = new LambdaUpdateWrapper<TicketCategory>()
-                .eq(TicketCategory::getId, categoryId)
-                .ge(TicketCategory::getAvailableStock, quantity)
-                .setSql("available_stock = available_stock - " + quantity);
-        int rows = categoryMapper.update(wrapper);
-        if(rows==0){
-            throw new BizException("库存不足");
-        }
-        return categoryMapper.selectById(categoryId);
-    }
-    
-    public void rollbackStock(Long categoryId, int quantity){
-        // 回补 MySQL 库存
-        LambdaUpdateWrapper<TicketCategory> wrapper = new LambdaUpdateWrapper<TicketCategory>()
-                .eq(TicketCategory::getId, categoryId)
-                .setSql("available_stock = available_stock + " + quantity);
-        categoryMapper.update(wrapper);
-
-        // 回补 Redis 库存（取消/超时场景）
-        TicketCategory cat = categoryMapper.selectById(categoryId);
-        if (cat != null) {
-            String stockKey = RedisKeyConstant.PROGRAM_STOCK + cat.getProgramId() + ":" + categoryId;
-            redisTemplate.opsForValue().increment(stockKey, quantity);
-        }
+    /**
+     * 释放座位 + 回补库存（取消/超时场景，由 OrderService 通过 Feign 调用）
+     */
+    public void releaseSeats(Long programId, Long categoryId, List<Long> seatIds) {
+        seatStrategy.releaseSeats(programId, categoryId, seatIds);
     }
 
     /**
-     * 锁定座位：使用 FOR UPDATE SKIP LOCKED 查询可用座位并标记为已锁定。
-     * SKIP LOCKED 使并发事务自动跳过已被其他事务锁定的行，避免竞态条件。
-     * 必须在事务内调用（由 grab() 的 @Transactional 保证）。
+     * 确认售出（支付成功场景，由 OrderService 通过 Feign 调用）
      */
-    public List<Seat> lockSeats(Long programId, Long categoryId, Long userId, int quantity) {
-        // 查询可用座位，FOR UPDATE SKIP LOCKED 保证不同事务选到不同座位
-        List<Seat> availableSeats = seatMapper.selectList(
-                new LambdaQueryWrapper<Seat>()
-                        .eq(Seat::getProgramId, programId)
-                        .eq(Seat::getCategoryId, categoryId)
-                        .eq(Seat::getStatus, 0)
-                        .orderByAsc(Seat::getArea, Seat::getRowNum, Seat::getColNum)
-                        .last("LIMIT " + quantity + " FOR UPDATE SKIP LOCKED"));
-
-        if (availableSeats.size() < quantity) {
-            throw new BizException("可用座位不足");
-        }
-
-        // 批量锁定座位（status=1 表示已锁定）
-        List<Long> seatIds = availableSeats.stream().map(Seat::getId).toList();
-        int affectedRows = seatMapper.update(new LambdaUpdateWrapper<Seat>()
-                .in(Seat::getId, seatIds)
-                .eq(Seat::getStatus, 0)
-                .set(Seat::getStatus, 1)
-                .set(Seat::getLockedBy, userId)
-                .set(Seat::getLockedAt, LocalDateTime.now()));
-
-        // 校验实际锁定数量，防止极端情况下的数据不一致
-        if (affectedRows < quantity) {
-            throw new BizException("座位锁定失败，请重试");
-        }
-
-        return availableSeats;
-    }
-
-    public void confirmSeats(List<Long> seatIds) {
-        if (seatIds == null || seatIds.isEmpty()) {
-            return;
-        }
-        seatMapper.update(new LambdaUpdateWrapper<Seat>()
-                .in(Seat::getId, seatIds)
-                .eq(Seat::getStatus, 1)
-                .set(Seat::getStatus, 2));
-    }
-
-    /**
-     * 释放座位：将已锁定的座位恢复为可用
-     */
-    public void releaseSeats(List<Long> seatIds) {
-        if (seatIds == null || seatIds.isEmpty()) {
-            return;
-        }
-        seatMapper.update(new LambdaUpdateWrapper<Seat>()
-                .in(Seat::getId, seatIds)
-                .set(Seat::getStatus, 0)
-                .set(Seat::getLockedBy, null)
-                .set(Seat::getLockedAt, null));
+    public void confirmSeats(Long programId, Long categoryId, List<Long> seatIds) {
+        seatStrategy.confirmSeats(programId, categoryId, seatIds);
     }
 }

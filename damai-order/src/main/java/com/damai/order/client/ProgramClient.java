@@ -11,13 +11,13 @@ import java.util.List;
 @FeignClient(name = "damai-program", path = "/api/program/internal")
 public interface ProgramClient {
 
-    @PostMapping("/rollbackStock")
-    Result<?> rollbackStock(@RequestParam("categoryId") Long categoryId,
-                            @RequestParam("quantity") Integer quantity);
-
     @PostMapping("/releaseSeats")
-    Result<?> releaseSeats(@RequestBody List<Long> seatIds);
+    Result<?> releaseSeats(@RequestParam("programId") Long programId,
+                           @RequestParam("categoryId") Long categoryId,
+                           @RequestBody List<Long> seatIds);
 
     @PostMapping("/confirmSeats")
-    Result<?> confirmSeats(@RequestBody List<Long> seatIds);
+    Result<?> confirmSeats(@RequestParam("programId") Long programId,
+                           @RequestParam("categoryId") Long categoryId,
+                           @RequestBody List<Long> seatIds);
 }

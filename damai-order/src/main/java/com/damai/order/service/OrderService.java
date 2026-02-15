@@ -72,7 +72,7 @@ public class OrderService {
         try {
             List<Long> seatIds = parseSeatIds(order.getSeatInfo());
             if (!seatIds.isEmpty()) {
-                programClient.confirmSeats(seatIds);
+                programClient.confirmSeats(order.getProgramId(), order.getCategoryId(), seatIds);
             }
         } catch (Exception e) {
             log.error("支付成功但确认座位失败, orderId={}, 需人工处理", orderId, e);
@@ -86,17 +86,15 @@ public class OrderService {
         order.setStatus(2);
         order.setCancelTime(LocalDateTime.now());
         orderMapper.updateById(order);
-        
+
         try {
-            // 回滚票档库存
-            programClient.rollbackStock(order.getCategoryId(), order.getQuantity());
-            // 释放座位
+            // 释放座位 + 回补库存（策略内部一次性处理）
             List<Long> seatIds = parseSeatIds(order.getSeatInfo());
             if (!seatIds.isEmpty()) {
-                programClient.releaseSeats(seatIds);
+                programClient.releaseSeats(order.getProgramId(), order.getCategoryId(), seatIds);
             }
         } catch (Exception e) {
-            log.error("回滚库存/释放座位失败, orderId={}", orderId, e);
+            log.error("释放座位失败, orderId={}", orderId, e);
         }
     }
 
@@ -105,7 +103,6 @@ public class OrderService {
      * 由定时任务调用。
      */
     public int cancelExpiredOrders() {
-        // 查询已过期且仍为待支付的订单，每次处理一批
         List<TicketOrder> expiredOrders = orderMapper.selectList(
                 new LambdaQueryWrapper<TicketOrder>()
                         .eq(TicketOrder::getStatus, 0)
@@ -115,16 +112,14 @@ public class OrderService {
         int count = 0;
         for (TicketOrder order : expiredOrders) {
             try {
-                // 更新订单状态为已取消
                 order.setStatus(2);
                 order.setCancelTime(LocalDateTime.now());
                 orderMapper.updateById(order);
 
                 // 释放座位 + 回补库存
-                programClient.rollbackStock(order.getCategoryId(), order.getQuantity());
                 List<Long> seatIds = parseSeatIds(order.getSeatInfo());
                 if (!seatIds.isEmpty()) {
-                    programClient.releaseSeats(seatIds);
+                    programClient.releaseSeats(order.getProgramId(), order.getCategoryId(), seatIds);
                 }
                 count++;
             } catch (Exception e) {
@@ -154,6 +149,4 @@ public class OrderService {
             return List.of();
         }
     }
-
-
 }

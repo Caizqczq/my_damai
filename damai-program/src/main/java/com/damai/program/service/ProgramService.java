@@ -2,10 +2,11 @@ package com.damai.program.service;
 
 import com.alibaba.fastjson.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.toolkit.IdWorker;
+import com.damai.common.constant.MqConstant;
 import com.damai.common.constant.RedisKeyConstant;
 import com.damai.common.exception.BizException;
-import com.damai.common.result.Result;
-import com.damai.program.client.OrderClient;
+import com.damai.common.mq.OrderCreateMessage;
 import com.damai.program.dto.*;
 import com.damai.program.entity.Program;
 import com.damai.program.entity.Seat;
@@ -17,10 +18,14 @@ import com.damai.program.strategy.GrabResult;
 import com.damai.program.strategy.SeatStrategy;
 import com.github.benmanes.caffeine.cache.Cache;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -28,6 +33,7 @@ import java.util.Map;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class ProgramService {
@@ -36,7 +42,7 @@ public class ProgramService {
     private final SeatMapper seatMapper;
     private final StringRedisTemplate redisTemplate;
     private final Cache<Long,ProgramDetailDTO> programDetailCache;
-    private final OrderClient orderClient;
+    private final RabbitTemplate rabbitTemplate;
     private final SeatStrategy seatStrategy;
 
     public void initStock(Long programId){
@@ -46,8 +52,6 @@ public class ProgramService {
         );
         Map<String,String> meta = new HashMap<>();
         for(TicketCategory cat:cats){
-            String stockKey = RedisKeyConstant.PROGRAM_STOCK+programId+":"+cat.getId();
-            redisTemplate.opsForValue().set(stockKey,cat.getAvailableStock().toString());
             meta.put(cat.getId().toString(), cat.getName());
 
             // ===== 座位数据预热到 Redis =====
@@ -66,36 +70,47 @@ public class ProgramService {
                             .eq(Seat::getCategoryId, cat.getId())
                             .orderByAsc(Seat::getArea, Seat::getRowNum, Seat::getColNum));
 
-            Map<String, String> seatMetaBatch = new HashMap<>();
-            for (int i = 0; i < seats.size(); i++) {
-                Seat seat = seats.get(i);
-                String seatId = seat.getId().toString();
-                double score = i; // 索引即排序权重，与 DB 排序一致
+            // ===== Pipeline 批量写入座位状态和元数据 =====
+            int batchSize = 2000;
+            byte[] availKeyBytes = availKey.getBytes(StandardCharsets.UTF_8);
+            byte[] lockedKeyBytes = lockedKey.getBytes(StandardCharsets.UTF_8);
+            byte[] soldKeyBytes = soldKey.getBytes(StandardCharsets.UTF_8);
+            byte[] seatMetaKeyBytes = seatMetaKey.getBytes(StandardCharsets.UTF_8);
 
-                switch (seat.getStatus()) {
-                    case 0 -> // 可用 → Sorted Set
-                            redisTemplate.opsForZSet().add(availKey, seatId, score);
-                    case 1 -> { // 已锁定 → Hash（value = userId:timestamp:score）
-                        String lockInfo = seat.getLockedBy() + ":"
-                                + System.currentTimeMillis() + ":" + i;
-                        redisTemplate.opsForHash().put(lockedKey, seatId, lockInfo);
+            for (int batchStart = 0; batchStart < seats.size(); batchStart += batchSize) {
+                int end = Math.min(batchStart + batchSize, seats.size());
+                int offset = batchStart;
+                List<Seat> batch = seats.subList(batchStart, end);
+
+                redisTemplate.executePipelined((RedisCallback<Object>) connection -> {
+                    for (int i = 0; i < batch.size(); i++) {
+                        Seat seat = batch.get(i);
+                        byte[] seatIdBytes = seat.getId().toString().getBytes(StandardCharsets.UTF_8);
+                        int globalIndex = offset + i;
+
+                        switch (seat.getStatus()) {
+                            case 0 -> connection.zSetCommands().zAdd(availKeyBytes, globalIndex, seatIdBytes);
+                            case 1 -> {
+                                String lockInfo = seat.getLockedBy() + ":"
+                                        + System.currentTimeMillis() + ":" + globalIndex;
+                                connection.hashCommands().hSet(lockedKeyBytes, seatIdBytes,
+                                        lockInfo.getBytes(StandardCharsets.UTF_8));
+                            }
+                            case 2 -> connection.setCommands().sAdd(soldKeyBytes, seatIdBytes);
+                        }
+
+                        // 座位元数据
+                        Map<String, Object> seatInfo = new HashMap<>();
+                        seatInfo.put("area", seat.getArea());
+                        seatInfo.put("row", seat.getRowNum());
+                        seatInfo.put("col", seat.getColNum());
+                        seatInfo.put("label", seat.getSeatLabel());
+                        seatInfo.put("price", seat.getPrice().toString());
+                        connection.hashCommands().hSet(seatMetaKeyBytes, seatIdBytes,
+                                JSON.toJSONString(seatInfo).getBytes(StandardCharsets.UTF_8));
                     }
-                    case 2 -> // 已售出 → Set
-                            redisTemplate.opsForSet().add(soldKey, seatId);
-                }
-
-                // 座位元数据（静态信息，供 grab 后组装订单用）
-                Map<String, Object> seatInfo = new HashMap<>();
-                seatInfo.put("area", seat.getArea());
-                seatInfo.put("row", seat.getRowNum());
-                seatInfo.put("col", seat.getColNum());
-                seatInfo.put("label", seat.getSeatLabel());
-                seatInfo.put("price", seat.getPrice().toString());
-                seatMetaBatch.put(seatId, JSON.toJSONString(seatInfo));
-            }
-
-            if (!seatMetaBatch.isEmpty()) {
-                redisTemplate.opsForHash().putAll(seatMetaKey, seatMetaBatch);
+                    return null;
+                });
             }
         }
         // 票档元信息：categoryId -> name
@@ -218,20 +233,20 @@ public class ProgramService {
             return stockDTO;
         }
 
-        // 已预热，完全从Redis读
+        // 已预热，完全从Redis读（用 ZCARD 替代 stockKey）
         StockDTO stockDTO=new StockDTO();
         stockDTO.setId(programId);
         List<StockDTO.CategoryStock> categories = new ArrayList<>();
         for(Map.Entry<Object,Object> entry : meta.entrySet()){
             Long categoryId = Long.parseLong(entry.getKey().toString());
             String name = entry.getValue().toString();
-            String stockKey = RedisKeyConstant.PROGRAM_STOCK+programId+":"+categoryId;
-            String val = redisTemplate.opsForValue().get(stockKey);
+            String availKey = RedisKeyConstant.SEAT_AVAIL + programId + ":" + categoryId;
+            Long available = redisTemplate.opsForZSet().zCard(availKey);
 
             StockDTO.CategoryStock cs = new StockDTO.CategoryStock();
             cs.setCategoryId(categoryId);
             cs.setName(name);
-            cs.setAvailable(val != null ? Integer.parseInt(val) : 0);
+            cs.setAvailable(available != null ? available.intValue() : 0);
             categories.add(cs);
         }
         stockDTO.setCategories(categories);
@@ -297,44 +312,41 @@ public class ProgramService {
                 .findFirst()
                 .orElseThrow(() -> new BizException("票档不存在"));
 
-        // ===== Phase 2: 创建订单（Feign 远程调用） =====
+        // ===== Phase 2: 发消息创建订单 =====
+        Long orderId = IdWorker.getId();
+        OrderCreateMessage msg = new OrderCreateMessage();
+        msg.setOrderId(orderId);
+        msg.setUserId(userId);
+        msg.setProgramId(programId);
+        msg.setCategoryId(categoryId);
+        msg.setProgramTitle(programDetail.getTitle());
+        msg.setCategoryName(categoryDTO.getName());
+        msg.setUnitPrice(categoryDTO.getPrice());
+        msg.setQuantity(quantity);
+        msg.setSeatInfo(JSON.toJSONString(grabResult.getSeatInfoList()));
+        msg.setSeatIds(grabResult.getSeatIds());
+
         try {
-            OrderCreateRequest createReq = new OrderCreateRequest();
-            createReq.setUserId(userId);
-            createReq.setProgramId(programId);
-            createReq.setCategoryId(categoryId);
-            createReq.setProgramTitle(programDetail.getTitle());
-            createReq.setCategoryName(categoryDTO.getName());
-            createReq.setUnitPrice(categoryDTO.getPrice());
-            createReq.setQuantity(quantity);
-            createReq.setSeatInfo(JSON.toJSONString(grabResult.getSeatInfoList()));
-
-            Result<Map<String, Object>> result = orderClient.createOrder(createReq);
-            if (result == null || result.getCode() != 200) {
-                throw new BizException("创建订单失败");
-            }
-
-            // 订单创建成功，异步回写DB
-            seatStrategy.afterOrderCreated(programId, categoryId, userId, quantity, grabResult.getSeatIds());
-
-            return Long.valueOf(result.getData().get("orderId").toString());
+            rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.ORDER_CREATE, msg);
         } catch (Exception e) {
-            // 订单创建失败，回滚预留资源
+            log.error("MQ 发送失败, orderId={}", orderId, e);
             redisTemplate.delete(dedupKey);
             seatStrategy.rollbackReserve(programId, categoryId, grabResult.getSeatIds());
-            throw e;
+            throw new BizException("系统繁忙，请稍后重试");
         }
+
+        return orderId;
     }
 
     /**
-     * 释放座位 + 回补库存（取消/超时场景，由 OrderService 通过 Feign 调用）
+     * 释放座位 + 回补库存（取消/超时场景，由 SeatOpsConsumer 通过 MQ 触发）
      */
     public void releaseSeats(Long programId, Long categoryId, List<Long> seatIds) {
         seatStrategy.releaseSeats(programId, categoryId, seatIds);
     }
 
     /**
-     * 确认售出（支付成功场景，由 OrderService 通过 Feign 调用）
+     * 确认售出（支付成功场景，由 SeatOpsConsumer 通过 MQ 触发）
      */
     public void confirmSeats(Long programId, Long categoryId, List<Long> seatIds) {
         seatStrategy.confirmSeats(programId, categoryId, seatIds);

@@ -25,6 +25,16 @@ spring:
     redis:
       host: localhost
       port: 6379
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: rabbitmq
+    password: rabbitmq
+    publisher-confirm-type: correlated
+    listener:
+      simple:
+        prefetch: 10
+        default-requeue-rejected: false
 
 
 mybatis-plus:

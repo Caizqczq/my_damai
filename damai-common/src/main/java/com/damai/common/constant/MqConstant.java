@@ -1,0 +1,22 @@
+package com.damai.common.constant;
+
+public class MqConstant {
+
+    public static final String EXCHANGE = "damai.direct";
+    public static final String DLX = "damai.dlx";
+
+    // 队列名 = 路由键（direct exchange 惯例）
+    public static final String ORDER_CREATE = "order.create";
+    public static final String ORDER_CREATE_DLQ = "order.create.dlq";
+    public static final String DB_SYNC = "db.sync";
+    public static final String DB_SYNC_DLQ = "db.sync.dlq";
+    public static final String SEAT_OPS = "seat.ops";
+    public static final String SEAT_OPS_DLQ = "seat.ops.dlq";
+
+    // 订单延迟取消（TTL 到期自动进 check 队列）
+    public static final String ORDER_DELAY = "order.delay";
+    public static final String ORDER_DELAY_CHECK = "order.delay.check";
+    public static final int ORDER_EXPIRE_MINUTES = 15;
+
+    private MqConstant() {}
+}

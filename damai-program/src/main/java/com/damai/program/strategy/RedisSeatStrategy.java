@@ -16,13 +16,11 @@ import org.springframework.data.redis.core.script.DefaultRedisScript;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.CompletableFuture;
 
 /**
- * V3 策略：Redis Lua 原子完成 扣库存 + 锁座位，DB 全部异步回写
+ * V3 策略：Redis Lua 原子完成 扣库存 + 锁座位，DB 回写由 MQ Consumer 同步执行
  */
 @Slf4j
 public class RedisSeatStrategy implements SeatStrategy {
@@ -56,19 +54,17 @@ public class RedisSeatStrategy implements SeatStrategy {
 
     @Override
     public GrabResult reserve(Long programId, Long categoryId, Long userId, int quantity) {
-        String stockKey  = RedisKeyConstant.PROGRAM_STOCK + programId + ":" + categoryId;
         String availKey  = RedisKeyConstant.SEAT_AVAIL + programId + ":" + categoryId;
         String lockedKey = RedisKeyConstant.SEAT_LOCKED + programId + ":" + categoryId;
 
-        // 单次 Lua 原子操作：扣库存 + 锁座位
+        // 单次 Lua 原子操作：检查库存(ZCARD) + 锁座位
         String luaResult = redisTemplate.execute(grabV3Script,
-                List.of(stockKey, availKey, lockedKey),
+                List.of(availKey, lockedKey),
                 String.valueOf(quantity), String.valueOf(userId), String.valueOf(System.currentTimeMillis()));
 
         JSONObject json = JSON.parseObject(luaResult);
         int code = json.getIntValue("code");
         if (code == -1) throw new BizException("库存不足");
-        if (code == -2) throw new BizException("可用座位不足");
 
         List<Long> seatIds = json.getJSONArray("seatIds")
                 .toJavaList(String.class).stream()
@@ -94,31 +90,21 @@ public class RedisSeatStrategy implements SeatStrategy {
 
     @Override
     public void afterOrderCreated(Long programId, Long categoryId, Long userId, int quantity, List<Long> seatIds) {
-        // V3: 异步同步库存 + 座位状态到 DB
-        CompletableFuture.runAsync(() -> {
-            try {
-                // 扣减 DB 库存
-                categoryMapper.update(new LambdaUpdateWrapper<TicketCategory>()
-                        .eq(TicketCategory::getId, categoryId)
-                        .ge(TicketCategory::getAvailableStock, quantity)
-                        .setSql("available_stock = available_stock - " + quantity));
-                // 锁定 DB 座位
-                seatMapper.update(new LambdaUpdateWrapper<Seat>()
-                        .in(Seat::getId, seatIds)
-                        .eq(Seat::getStatus, 0)
-                        .set(Seat::getStatus, 1)
-                        .set(Seat::getLockedBy, userId)
-                        .set(Seat::getLockedAt, LocalDateTime.now()));
-            } catch (Exception e) {
-                log.error("V3 异步同步DB失败, programId={}, seatIds={}", programId, seatIds, e);
-                // TODO: 推入补偿队列
-            }
-        });
+        // 由 DbSyncConsumer 同步调用，直接执行 DB 回写
+        categoryMapper.update(new LambdaUpdateWrapper<TicketCategory>()
+                .eq(TicketCategory::getId, categoryId)
+                .ge(TicketCategory::getAvailableStock, quantity)
+                .setSql("available_stock = available_stock - " + quantity));
+        seatMapper.update(new LambdaUpdateWrapper<Seat>()
+                .in(Seat::getId, seatIds)
+                .eq(Seat::getStatus, 0)
+                .set(Seat::getStatus, 1)
+                .set(Seat::getLockedBy, userId)
+                .set(Seat::getLockedAt, LocalDateTime.now()));
     }
 
     @Override
     public void rollbackReserve(Long programId, Long categoryId, List<Long> seatIds) {
-        // release_seats.lua 原子释放座位 + 回补库存
         executeReleaseLua(programId, categoryId, seatIds);
     }
 
@@ -126,21 +112,15 @@ public class RedisSeatStrategy implements SeatStrategy {
     public void releaseSeats(Long programId, Long categoryId, List<Long> seatIds) {
         // 1. Redis: Lua 原子释放
         executeReleaseLua(programId, categoryId, seatIds);
-        // 2. DB: 异步回写
-        CompletableFuture.runAsync(() -> {
-            try {
-                seatMapper.update(new LambdaUpdateWrapper<Seat>()
-                        .in(Seat::getId, seatIds)
-                        .set(Seat::getStatus, 0)
-                        .set(Seat::getLockedBy, null)
-                        .set(Seat::getLockedAt, null));
-                categoryMapper.update(new LambdaUpdateWrapper<TicketCategory>()
-                        .eq(TicketCategory::getId, categoryId)
-                        .setSql("available_stock = available_stock + " + seatIds.size()));
-            } catch (Exception e) {
-                log.error("V3 异步释放座位DB失败, seatIds={}", seatIds, e);
-            }
-        });
+        // 2. DB: 同步回写（由 MQ Consumer 调用，有重试保障）
+        seatMapper.update(new LambdaUpdateWrapper<Seat>()
+                .in(Seat::getId, seatIds)
+                .set(Seat::getStatus, 0)
+                .set(Seat::getLockedBy, null)
+                .set(Seat::getLockedAt, null));
+        categoryMapper.update(new LambdaUpdateWrapper<TicketCategory>()
+                .eq(TicketCategory::getId, categoryId)
+                .setSql("available_stock = available_stock + " + seatIds.size()));
     }
 
     @Override
@@ -150,26 +130,19 @@ public class RedisSeatStrategy implements SeatStrategy {
         String soldKey   = RedisKeyConstant.SEAT_SOLD + programId + ":" + categoryId;
         redisTemplate.execute(confirmSeatsScript,
                 List.of(lockedKey, soldKey),
-                seatIds.stream().map(String::valueOf).toArray(String[]::new));
-        // 2. DB: 异步回写
-        CompletableFuture.runAsync(() -> {
-            try {
-                seatMapper.update(new LambdaUpdateWrapper<Seat>()
-                        .in(Seat::getId, seatIds)
-                        .eq(Seat::getStatus, 1)
-                        .set(Seat::getStatus, 2));
-            } catch (Exception e) {
-                log.error("V3 异步确认座位DB失败, seatIds={}", seatIds, e);
-            }
-        });
+                (Object[]) seatIds.stream().map(String::valueOf).toArray(String[]::new));
+        // 2. DB: 同步回写
+        seatMapper.update(new LambdaUpdateWrapper<Seat>()
+                .in(Seat::getId, seatIds)
+                .eq(Seat::getStatus, 1)
+                .set(Seat::getStatus, 2));
     }
 
     private void executeReleaseLua(Long programId, Long categoryId, List<Long> seatIds) {
-        String stockKey  = RedisKeyConstant.PROGRAM_STOCK + programId + ":" + categoryId;
         String availKey  = RedisKeyConstant.SEAT_AVAIL + programId + ":" + categoryId;
         String lockedKey = RedisKeyConstant.SEAT_LOCKED + programId + ":" + categoryId;
         redisTemplate.execute(releaseSeatsScript,
-                List.of(stockKey, availKey, lockedKey),
-                seatIds.stream().map(String::valueOf).toArray(String[]::new));
+                List.of(availKey, lockedKey),
+                (Object[]) seatIds.stream().map(String::valueOf).toArray(String[]::new));
     }
 }

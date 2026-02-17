@@ -1,6 +1,5 @@
--- KEYS[1]: program:stock:{programId}:{categoryId}  (库存)
--- KEYS[2]: seat:avail:{programId}:{categoryId}     (可用座位)
--- KEYS[3]: seat:locked:{programId}:{categoryId}    (已锁定座位)
+-- KEYS[1]: seat:avail:{programId}:{categoryId}     (可用座位 ZSet)
+-- KEYS[2]: seat:locked:{programId}:{categoryId}    (已锁定座位 Hash)
 -- ARGV[1]: quantity  购买数量
 -- ARGV[2]: userId    用户ID
 -- ARGV[3]: timestamp 当前时间戳(毫秒)
@@ -8,18 +7,16 @@
 -- 返回值:
 --   JSON {code:0, seatIds:[...]}   成功
 --   JSON {code:-1}                 库存不足
---   JSON {code:-2}                 可用座位不足
 
-local stockKey = KEYS[1]
-local availKey  = KEYS[2]
-local lockedKey = KEYS[3]
+local availKey  = KEYS[1]
+local lockedKey = KEYS[2]
 
 local quantity  = tonumber(ARGV[1])
 local userId    = ARGV[2]
 local timestamp = ARGV[3]
 
--- Step 1: 检查库存
-local stock = tonumber(redis.call('GET', stockKey) or '0')
+-- Step 1: 用 ZCARD 检查可用座位数（替代独立的 stockKey）
+local stock = redis.call('ZCARD', availKey)
 if stock < quantity then
     return '{"code":-1}'
 end
@@ -27,12 +24,10 @@ end
 -- Step 2: 取出 N 个可用座位（按 Score 升序，即按 area/row/col 排序）
 local seats = redis.call('ZRANGE', availKey, 0, quantity - 1, 'WITHSCORES')
 if #seats < quantity * 2 then
-    return '{"code":-2}'
+    return '{"code":-1}'
 end
 
--- Step 3: 原子执行——扣库存 + 锁座位
-redis.call('DECRBY', stockKey, quantity)
-
+-- Step 3: 原子执行——锁座位（不再需要扣 stockKey）
 local lockInfo = userId .. ':' .. timestamp
 local locked = {}
 for i = 1, quantity * 2, 2 do
@@ -53,5 +48,3 @@ end
 result = result .. ']}'
 
 return result
-
-

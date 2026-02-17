@@ -4,13 +4,15 @@ import com.alibaba.fastjson.JSON;
 import com.alibaba.fastjson.JSONArray;
 import com.alibaba.fastjson.JSONObject;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.damai.common.constant.MqConstant;
 import com.damai.common.exception.BizException;
-import com.damai.order.client.ProgramClient;
+import com.damai.common.mq.SeatOpsMessage;
 import com.damai.order.dto.OrderCreateRequest;
 import com.damai.order.entity.TicketOrder;
 import com.damai.order.mapper.OrderMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
@@ -23,7 +25,7 @@ import java.util.List;
 @RequiredArgsConstructor
 public class OrderService {
     private final OrderMapper orderMapper;
-    private final ProgramClient programClient;
+    private final RabbitTemplate rabbitTemplate;
 
     public Long create(OrderCreateRequest req){
         TicketOrder order = new TicketOrder();
@@ -68,14 +70,19 @@ public class OrderService {
         order.setPayTime(LocalDateTime.now());
         orderMapper.updateById(order);
 
-        // 支付成功后，将座位状态从锁定(1)改为已售出(2)
+        // 支付成功后，发送 MQ 消息确认座位
         try {
             List<Long> seatIds = parseSeatIds(order.getSeatInfo());
             if (!seatIds.isEmpty()) {
-                programClient.confirmSeats(order.getProgramId(), order.getCategoryId(), seatIds);
+                SeatOpsMessage msg = new SeatOpsMessage();
+                msg.setOpsType(SeatOpsMessage.OpsType.CONFIRM);
+                msg.setProgramId(order.getProgramId());
+                msg.setCategoryId(order.getCategoryId());
+                msg.setSeatIds(seatIds);
+                rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.SEAT_OPS, msg);
             }
         } catch (Exception e) {
-            log.error("支付成功但确认座位失败, orderId={}, 需人工处理", orderId, e);
+            log.error("支付成功但发送座位确认消息失败, orderId={}, 需人工处理", orderId, e);
         }
     }
 
@@ -88,45 +95,19 @@ public class OrderService {
         orderMapper.updateById(order);
 
         try {
-            // 释放座位 + 回补库存（策略内部一次性处理）
+            // 发送 MQ 消息释放座位
             List<Long> seatIds = parseSeatIds(order.getSeatInfo());
             if (!seatIds.isEmpty()) {
-                programClient.releaseSeats(order.getProgramId(), order.getCategoryId(), seatIds);
+                SeatOpsMessage msg = new SeatOpsMessage();
+                msg.setOpsType(SeatOpsMessage.OpsType.RELEASE);
+                msg.setProgramId(order.getProgramId());
+                msg.setCategoryId(order.getCategoryId());
+                msg.setSeatIds(seatIds);
+                rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.SEAT_OPS, msg);
             }
         } catch (Exception e) {
-            log.error("释放座位失败, orderId={}", orderId, e);
+            log.error("释放座位消息发送失败, orderId={}", orderId, e);
         }
-    }
-
-    /**
-     * 扫描并取消超时未支付的订单，释放座位并回补库存。
-     * 由定时任务调用。
-     */
-    public int cancelExpiredOrders() {
-        List<TicketOrder> expiredOrders = orderMapper.selectList(
-                new LambdaQueryWrapper<TicketOrder>()
-                        .eq(TicketOrder::getStatus, 0)
-                        .lt(TicketOrder::getExpireTime, LocalDateTime.now())
-                        .last("LIMIT 100"));
-
-        int count = 0;
-        for (TicketOrder order : expiredOrders) {
-            try {
-                order.setStatus(2);
-                order.setCancelTime(LocalDateTime.now());
-                orderMapper.updateById(order);
-
-                // 释放座位 + 回补库存
-                List<Long> seatIds = parseSeatIds(order.getSeatInfo());
-                if (!seatIds.isEmpty()) {
-                    programClient.releaseSeats(order.getProgramId(), order.getCategoryId(), seatIds);
-                }
-                count++;
-            } catch (Exception e) {
-                log.error("自动取消超时订单失败, orderId={}", order.getId(), e);
-            }
-        }
-        return count;
     }
 
     /**

@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "mcp__exa__web_search_exa",
-      "Bash(grep:*)"
+      "Bash(grep:*)",
+      "Bash(find:*)"
     ]
   }
 }

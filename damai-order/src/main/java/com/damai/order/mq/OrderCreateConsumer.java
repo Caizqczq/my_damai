@@ -58,8 +58,12 @@ public class OrderCreateConsumer {
             rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.DB_SYNC, sync);
 
             // 发送延迟检查消息：15 分钟后到期，自动进入 order.delay.check 队列
+            // 带上座位信息，消费时直接用，无需再查 DB
             rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.ORDER_DELAY,
-                    Map.of("orderId", msg.getOrderId()));
+                    Map.of("orderId", msg.getOrderId(),
+                           "programId", msg.getProgramId(),
+                           "categoryId", msg.getCategoryId(),
+                           "seatIds", msg.getSeatIds()));
         } catch (Exception e) {
             log.error("订单创建失败, orderId={}, 异常: {}", msg.getOrderId(), e.getMessage(), e);
             throw e;

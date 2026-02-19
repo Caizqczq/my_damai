@@ -60,17 +60,19 @@ public class OrderService {
     }
 
     public void pay(Long orderId) {
-        TicketOrder order = orderMapper.selectById(orderId);
-        if (order == null) throw new BizException("订单不存在");
-        if (order.getStatus() != 0) throw new BizException("订单状态不允许支付");
-        if (order.getExpireTime().isBefore(LocalDateTime.now())) {
+        // 单条 UPDATE 完成状态校验 + 过期校验 + 状态转移，数据库行锁保证原子性
+        int rows = orderMapper.payOrder(orderId, LocalDateTime.now());
+        if (rows == 0) {
+            // 失败才查一次，区分具体原因返回给用户
+            TicketOrder order = orderMapper.selectById(orderId);
+            if (order == null) throw new BizException("订单不存在");
+            if (order.getStatus() == 1) throw new BizException("订单已支付，请勿重复操作");
+            if (order.getStatus() == 2) throw new BizException("订单已取消");
             throw new BizException("订单已过期");
         }
-        order.setStatus(1);
-        order.setPayTime(LocalDateTime.now());
-        orderMapper.updateById(order);
 
-        // 支付成功后，发送 MQ 消息确认座位
+        // 支付成功，查订单数据发 MQ 确认座位
+        TicketOrder order = orderMapper.selectById(orderId);
         try {
             List<Long> seatIds = parseSeatIds(order.getSeatInfo());
             if (!seatIds.isEmpty()) {
@@ -87,15 +89,19 @@ public class OrderService {
     }
 
     public void cancel(Long orderId) {
-        TicketOrder order = orderMapper.selectById(orderId);
-        if (order == null) throw new BizException("订单不存在");
-        if (order.getStatus() != 0) throw new BizException("订单状态不允许取消");
-        order.setStatus(2);
-        order.setCancelTime(LocalDateTime.now());
-        orderMapper.updateById(order);
+        // 单条 UPDATE 完成状态校验 + 状态转移
+        int rows = orderMapper.cancelOrder(orderId, LocalDateTime.now());
+        if (rows == 0) {
+            TicketOrder order = orderMapper.selectById(orderId);
+            if (order == null) throw new BizException("订单不存在");
+            if (order.getStatus() == 1) throw new BizException("订单已支付，无法取消");
+            if (order.getStatus() == 2) throw new BizException("订单已取消");
+            throw new BizException("订单状态不允许取消");
+        }
 
+        // 取消成功，查订单数据发 MQ 释放座位
+        TicketOrder order = orderMapper.selectById(orderId);
         try {
-            // 发送 MQ 消息释放座位
             List<Long> seatIds = parseSeatIds(order.getSeatInfo());
             if (!seatIds.isEmpty()) {
                 SeatOpsMessage msg = new SeatOpsMessage();

@@ -38,9 +38,9 @@ public class OrderDelayCheckConsumer {
         }
         log.info("延迟队列取消超时订单, orderId={}", orderId);
 
-        // seatIds 从消息体直接取，不查 DB
         Long programId = ((Number) msg.get("programId")).longValue();
         Long categoryId = ((Number) msg.get("categoryId")).longValue();
+        int quantity = ((Number) msg.get("quantity")).intValue();
         List<Long> seatIds = ((List<?>) msg.get("seatIds")).stream()
                 .map(o -> ((Number) o).longValue()).toList();
 
@@ -50,6 +50,7 @@ public class OrderDelayCheckConsumer {
             seatMsg.setProgramId(programId);
             seatMsg.setCategoryId(categoryId);
             seatMsg.setSeatIds(seatIds);
+            seatMsg.setQuantity(quantity);
             rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.SEAT_OPS, seatMsg);
         }
     }

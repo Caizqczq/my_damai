@@ -3,7 +3,6 @@ package com.damai.common.mq;
 import lombok.Data;
 
 import java.math.BigDecimal;
-import java.util.List;
 
 @Data
 public class OrderCreateMessage {
@@ -15,6 +14,4 @@ public class OrderCreateMessage {
     private String categoryName;
     private BigDecimal unitPrice;
     private Integer quantity;
-    private String seatInfo;
-    private List<Long> seatIds;
 }

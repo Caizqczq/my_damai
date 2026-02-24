@@ -15,4 +15,5 @@ public class SeatOpsMessage {
     private Long programId;
     private Long categoryId;
     private List<Long> seatIds;
+    private Integer quantity;
 }

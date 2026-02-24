@@ -40,8 +40,6 @@ public class RabbitMqConfig {
 
         Queue orderQ    = QueueBuilder.durable(MqConstant.ORDER_CREATE).deadLetterExchange(MqConstant.DLX).deadLetterRoutingKey(MqConstant.ORDER_CREATE_DLQ).build();
         Queue orderDlq  = QueueBuilder.durable(MqConstant.ORDER_CREATE_DLQ).build();
-        Queue dbSyncQ   = QueueBuilder.durable(MqConstant.DB_SYNC).deadLetterExchange(MqConstant.DLX).deadLetterRoutingKey(MqConstant.DB_SYNC_DLQ).build();
-        Queue dbSyncDlq = QueueBuilder.durable(MqConstant.DB_SYNC_DLQ).build();
         Queue seatOpsQ  = QueueBuilder.durable(MqConstant.SEAT_OPS).deadLetterExchange(MqConstant.DLX).deadLetterRoutingKey(MqConstant.SEAT_OPS_DLQ).build();
         Queue seatDlq   = QueueBuilder.durable(MqConstant.SEAT_OPS_DLQ).build();
 
@@ -54,12 +52,10 @@ public class RabbitMqConfig {
 
         return new Declarables(
                 ex, dlx,
-                orderQ, orderDlq, dbSyncQ, dbSyncDlq, seatOpsQ, seatDlq,
+                orderQ, orderDlq, seatOpsQ, seatDlq,
                 delayQ, checkQ,
                 bind(orderQ).to(ex).with(MqConstant.ORDER_CREATE),
                 bind(orderDlq).to(dlx).with(MqConstant.ORDER_CREATE_DLQ),
-                bind(dbSyncQ).to(ex).with(MqConstant.DB_SYNC),
-                bind(dbSyncDlq).to(dlx).with(MqConstant.DB_SYNC_DLQ),
                 bind(seatOpsQ).to(ex).with(MqConstant.SEAT_OPS),
                 bind(seatDlq).to(dlx).with(MqConstant.SEAT_OPS_DLQ),
                 bind(delayQ).to(ex).with(MqConstant.ORDER_DELAY),

@@ -27,7 +27,7 @@ public class OrderService {
     private final OrderMapper orderMapper;
     private final RabbitTemplate rabbitTemplate;
 
-    public Long create(OrderCreateRequest req){
+    public Long create(OrderCreateRequest req) {
         TicketOrder order = new TicketOrder();
         order.setUserId(req.getUserId());
         order.setProgramId(req.getProgramId());
@@ -81,6 +81,7 @@ public class OrderService {
                 msg.setProgramId(order.getProgramId());
                 msg.setCategoryId(order.getCategoryId());
                 msg.setSeatIds(seatIds);
+                msg.setQuantity(order.getQuantity());
                 rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.SEAT_OPS, msg);
             }
         } catch (Exception e) {
@@ -109,6 +110,7 @@ public class OrderService {
                 msg.setProgramId(order.getProgramId());
                 msg.setCategoryId(order.getCategoryId());
                 msg.setSeatIds(seatIds);
+                msg.setQuantity(order.getQuantity());
                 rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.SEAT_OPS, msg);
             }
         } catch (Exception e) {

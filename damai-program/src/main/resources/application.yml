@@ -49,8 +49,9 @@ spring:
         default-requeue-rejected: false
 
 damai:
-  seat:
-    strategy: redis  # redis(V3) 或 database(V2)
+  stock:
+    bucket-size: 50000    # 每桶约装多少张票（库存/bucket-size=桶数）
+    max-buckets: 32     # 单票档最大桶数上限
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml

@@ -3,7 +3,10 @@
     "allow": [
       "mcp__exa__web_search_exa",
       "Bash(grep:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "WebFetch(domain:developer.aliyun.com)",
+      "WebFetch(domain:news.qq.com)",
+      "WebFetch(domain:singhajit.com)"
     ]
   }
 }

@@ -13,6 +13,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -88,9 +89,9 @@ public class RedisSeatStrategy implements SeatStrategy {
         return result;
     }
 
+    @Transactional
     @Override
     public void afterOrderCreated(Long programId, Long categoryId, Long userId, int quantity, List<Long> seatIds) {
-        // 由 DbSyncConsumer 同步调用，直接执行 DB 回写
         categoryMapper.update(new LambdaUpdateWrapper<TicketCategory>()
                 .eq(TicketCategory::getId, categoryId)
                 .ge(TicketCategory::getAvailableStock, quantity)
@@ -108,11 +109,12 @@ public class RedisSeatStrategy implements SeatStrategy {
         executeReleaseLua(programId, categoryId, seatIds);
     }
 
+    @Transactional
     @Override
     public void releaseSeats(Long programId, Long categoryId, List<Long> seatIds) {
         // 1. Redis: Lua 原子释放
         executeReleaseLua(programId, categoryId, seatIds);
-        // 2. DB: 同步回写（由 MQ Consumer 调用，有重试保障）
+        // 2. DB: 事务回写
         seatMapper.update(new LambdaUpdateWrapper<Seat>()
                 .in(Seat::getId, seatIds)
                 .set(Seat::getStatus, 0)
@@ -131,7 +133,7 @@ public class RedisSeatStrategy implements SeatStrategy {
         redisTemplate.execute(confirmSeatsScript,
                 List.of(lockedKey, soldKey),
                 (Object[]) seatIds.stream().map(String::valueOf).toArray(String[]::new));
-        // 2. DB: 同步回写
+        // 2. DB: 单条 SQL，本身就是原子的
         seatMapper.update(new LambdaUpdateWrapper<Seat>()
                 .in(Seat::getId, seatIds)
                 .eq(Seat::getStatus, 1)

@@ -327,7 +327,14 @@ public class ProgramService {
         msg.setSeatIds(grabResult.getSeatIds());
 
         try {
-            rabbitTemplate.convertAndSend(MqConstant.EXCHANGE, MqConstant.ORDER_CREATE, msg);
+            // 同步等待 Broker 确认，确保消息不丢
+            Boolean confirmed = rabbitTemplate.invoke(operations -> {
+                operations.convertAndSend(MqConstant.EXCHANGE, MqConstant.ORDER_CREATE, msg);
+                return operations.waitForConfirms(5000);
+            });
+            if (Boolean.FALSE.equals(confirmed)) {
+                throw new RuntimeException("Broker NACK");
+            }
         } catch (Exception e) {
             log.error("MQ 发送失败, orderId={}", orderId, e);
             redisTemplate.delete(dedupKey);

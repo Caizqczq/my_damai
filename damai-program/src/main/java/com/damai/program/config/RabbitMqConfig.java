@@ -1,6 +1,7 @@
 package com.damai.program.config;
 
 import com.damai.common.constant.MqConstant;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.core.*;
 import org.springframework.amqp.rabbit.connection.ConnectionFactory;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -11,6 +12,7 @@ import org.springframework.context.annotation.Configuration;
 
 import static org.springframework.amqp.core.BindingBuilder.bind;
 
+@Slf4j
 @Configuration
 public class RabbitMqConfig {
 
@@ -23,6 +25,11 @@ public class RabbitMqConfig {
     public RabbitTemplate rabbitTemplate(ConnectionFactory cf, MessageConverter mc) {
         RabbitTemplate t = new RabbitTemplate(cf);
         t.setMessageConverter(mc);
+        // 开启 mandatory：消息无法路由到队列时回调
+        t.setMandatory(true);
+        t.setReturnsCallback(returned ->
+                log.error("MQ消息路由失败: exchange={}, routingKey={}, replyText={}",
+                        returned.getExchange(), returned.getRoutingKey(), returned.getReplyText()));
         return t;
     }
 

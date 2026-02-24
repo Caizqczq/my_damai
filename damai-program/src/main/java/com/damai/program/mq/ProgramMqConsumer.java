@@ -12,7 +12,7 @@ import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.stereotype.Component;
 
 /**
- * program-service 的所有 MQ 消费者（3 个队列合并到一个类）
+ * program-service 的所有 MQ 消费者
  */
 @Slf4j
 @Component
@@ -47,6 +47,39 @@ public class ProgramMqConsumer {
             seatStrategy.rollbackReserve(msg.getProgramId(), msg.getCategoryId(), msg.getSeatIds());
         } catch (Exception e) {
             log.error("DLQ回滚失败, orderId={}, 需人工介入", msg.getOrderId(), e);
+        }
+    }
+
+    /** DB 同步 DLQ：重试 afterOrderCreated */
+    @RabbitListener(queues = MqConstant.DB_SYNC_DLQ)
+    public void onDbSyncDlq(DbSyncMessage msg) {
+        try {
+            log.warn("DB同步DLQ重试, programId={}, categoryId={}, seatIds={}",
+                    msg.getProgramId(), msg.getCategoryId(), msg.getSeatIds());
+            seatStrategy.afterOrderCreated(
+                    msg.getProgramId(), msg.getCategoryId(),
+                    msg.getUserId(), msg.getQuantity(), msg.getSeatIds());
+        } catch (Exception e) {
+            log.error("【严重】DB同步DLQ重试仍失败, 需人工介入. programId={}, seatIds={}",
+                    msg.getProgramId(), msg.getSeatIds(), e);
+        }
+    }
+
+    /** 座位操作 DLQ：重试 confirm/release */
+    @RabbitListener(queues = MqConstant.SEAT_OPS_DLQ)
+    public void onSeatOpsDlq(SeatOpsMessage msg) {
+        try {
+            log.warn("座位操作DLQ重试, opsType={}, seatIds={}",
+                    msg.getOpsType(), msg.getSeatIds());
+            switch (msg.getOpsType()) {
+                case RELEASE -> programService.releaseSeats(
+                        msg.getProgramId(), msg.getCategoryId(), msg.getSeatIds());
+                case CONFIRM -> programService.confirmSeats(
+                        msg.getProgramId(), msg.getCategoryId(), msg.getSeatIds());
+            }
+        } catch (Exception e) {
+            log.error("【严重】座位操作DLQ重试仍失败, 需人工介入. type={}, seatIds={}",
+                    msg.getOpsType(), msg.getSeatIds(), e);
         }
     }
 }

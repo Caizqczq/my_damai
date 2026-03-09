@@ -9,10 +9,8 @@ import com.damai.common.exception.BizException;
 import com.damai.common.mq.OrderCreateMessage;
 import com.damai.program.dto.*;
 import com.damai.program.entity.Program;
-import com.damai.program.entity.Seat;
 import com.damai.program.entity.TicketCategory;
 import com.damai.program.mapper.ProgramMapper;
-import com.damai.program.mapper.SeatMapper;
 import com.damai.program.mapper.TicketCategoryMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import lombok.RequiredArgsConstructor;
@@ -35,12 +33,10 @@ import java.util.stream.Collectors;
 public class ProgramService {
     private final ProgramMapper programMapper;
     private final TicketCategoryMapper categoryMapper;
-    private final SeatMapper seatMapper;
     private final StringRedisTemplate redisTemplate;
     private final Cache<Long, ProgramDetailDTO> programDetailCache;
     private final RabbitTemplate rabbitTemplate;
     private final StockBucketService stockBucketService;
-    private final SeatAllocationService seatAllocationService;
 
     public void initStock(Long programId) {
         List<TicketCategory> cats = categoryMapper.selectList(
@@ -169,47 +165,16 @@ public class ProgramService {
         return stockDTO;
     }
 
-    public List<SeatDTO> seats(Long programId, Long categoryId) {
-        LambdaQueryWrapper<Seat> wrapper = new LambdaQueryWrapper<Seat>()
-                .eq(Seat::getProgramId, programId);
-        if (categoryId != null) {
-            wrapper.eq(Seat::getCategoryId, categoryId);
-        }
-        wrapper.orderByAsc(Seat::getArea, Seat::getRowNum, Seat::getColNum);
-        List<Seat> seatList = seatMapper.selectList(wrapper);
-
-        Map<String, Map<String, List<Seat>>> grouped = seatList.stream()
-                .collect(Collectors.groupingBy(Seat::getArea,
-                        Collectors.groupingBy(Seat::getRowNum)));
-        return grouped.entrySet().stream().map(areaEntry -> {
-            SeatDTO dto = new SeatDTO();
-            dto.setArea(areaEntry.getKey());
-            dto.setRows(areaEntry.getValue().entrySet().stream().map(rowEntry -> {
-                SeatDTO.SeatRow row = new SeatDTO.SeatRow();
-                row.setRowNum(rowEntry.getKey());
-                row.setSeats(rowEntry.getValue().stream().map(s -> {
-                    SeatDTO.SeatInfo info = new SeatDTO.SeatInfo();
-                    info.setSeatId(s.getId());
-                    info.setCol(s.getColNum());
-                    info.setLabel(s.getSeatLabel());
-                    info.setStatus(s.getStatus());
-                    info.setPrice(s.getPrice());
-                    return info;
-                }).toList());
-                return row;
-            }).toList());
-            return dto;
-        }).toList();
-    }
-
-
     public Long grab(Long userId, GrabRequest req) {
         Long programId = req.getProgramId();
         Long categoryId = req.getCategoryId();
         int quantity = req.getQuantity().intValue();
 
         String dedupKey = "order:dedup:" + userId + ":" + programId + ":" + categoryId;
-        redisTemplate.opsForValue().setIfAbsent(dedupKey, "1", 1, TimeUnit.MINUTES);
+        Boolean accepted = redisTemplate.opsForValue().setIfAbsent(dedupKey, "1", 30, TimeUnit.SECONDS);
+        if (!Boolean.TRUE.equals(accepted)) {
+            throw new BizException("请求过于频繁，请稍后再试");
+        }
 
         // ===== Phase 1: 分桶 DECR 扣减库存（极轻量） =====
         boolean deducted;
@@ -264,6 +229,20 @@ public class ProgramService {
     }
 
     /**
+     * 待支付订单异步占用 DB 库存，保证重启后库存口径不丢。
+     */
+    public void reserveDbStock(Long categoryId, int quantity) {
+        int rows = categoryMapper.update(null,
+                new com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<TicketCategory>()
+                        .eq(TicketCategory::getId, categoryId)
+                        .ge(TicketCategory::getAvailableStock, quantity)
+                        .setSql("available_stock = available_stock - " + quantity));
+        if (rows == 0) {
+            throw new BizException("DB库存不足");
+        }
+    }
+
+    /**
      * 查询所有在售节目 ID（status=1）
      */
     public List<Long> allOnSaleProgramIds() {
@@ -273,17 +252,13 @@ public class ProgramService {
     }
 
     /**
-     * 释放座位 + 回补库存（取消/超时场景，由 SeatOpsConsumer 通过 MQ 触发）
+     * 未支付订单取消时仅回补票档库存，不再回滚具体座位。
      */
-    public void releaseSeats(Long programId, Long categoryId, List<Long> seatIds, int quantity) {
-        seatAllocationService.release(programId, categoryId, seatIds);
+    public void restoreStock(Long programId, Long categoryId, int quantity) {
         stockBucketService.restore(programId, categoryId, quantity);
-    }
-
-    /**
-     * 确认售出（支付成功场景，由 SeatOpsConsumer 通过 MQ 触发）
-     */
-    public void confirmSeats(Long programId, Long categoryId, List<Long> seatIds) {
-        seatAllocationService.confirm(programId, categoryId, seatIds);
+        categoryMapper.update(null,
+                new com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<TicketCategory>()
+                        .eq(TicketCategory::getId, categoryId)
+                        .setSql("available_stock = available_stock + " + quantity));
     }
 }

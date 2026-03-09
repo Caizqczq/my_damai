@@ -1,12 +1,9 @@
 package com.damai.order.controller;
 
 import com.damai.common.result.Result;
-import com.damai.order.dto.OrderCreateRequest;
 import com.damai.order.service.OrderService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
-
-import java.util.Map;
 
 @RestController
 @RequestMapping("/api/order")
@@ -14,15 +11,6 @@ import java.util.Map;
 public class OrderController {
 
     private final OrderService orderService;
-
-    /**
-     * 内部接口：供 program 服务调用创建订单
-     */
-    @PostMapping("/internal/create")
-    public Result<?> create(@RequestBody OrderCreateRequest createRequest) {
-        Long orderId = orderService.create(createRequest);
-        return Result.ok(Map.of("orderId",orderId));
-    }
 
     @GetMapping("/my")
     public Result<?> myOrders(@RequestHeader("X-User-Id") Long userId) {
@@ -37,7 +25,15 @@ public class OrderController {
     @PostMapping("/{orderId}/pay")
     public Result<?> pay(@PathVariable Long orderId) {
         orderService.pay(orderId);
-        return Result.ok();
+        return Result.ok("已模拟支付成功回调");
+    }
+
+    @PostMapping("/{orderId}/mock-pay-callback")
+    public Result<?> mockPayCallback(@PathVariable Long orderId,
+                                     @RequestParam(value = "tradeNo", required = false) String tradeNo) {
+        orderService.handleMockPaymentSuccess(orderId,
+                tradeNo != null ? tradeNo : ("MOCKCALLBACK-" + orderId + "-" + System.currentTimeMillis()));
+        return Result.ok("已处理模拟第三方支付回调");
     }
 
     @PostMapping("/{orderId}/cancel")

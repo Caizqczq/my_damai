@@ -3,7 +3,6 @@ package com.damai.program.entity;
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
 import com.baomidou.mybatisplus.annotation.TableName;
-import com.baomidou.mybatisplus.annotation.Version;
 import lombok.Data;
 
 import java.math.BigDecimal;
@@ -22,8 +21,6 @@ public class Seat {
     private String seatLabel;
     private BigDecimal price;
     private Integer status;
-    @Version
-    private Integer version;
     private Long lockedBy;
     private LocalDateTime lockedAt;
     private LocalDateTime createdAt;

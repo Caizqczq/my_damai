@@ -1,4 +1,4 @@
-package com.damai.program.entity;
+package com.damai.order.entity;
 
 import com.baomidou.mybatisplus.annotation.IdType;
 import com.baomidou.mybatisplus.annotation.TableId;
@@ -9,15 +9,16 @@ import java.math.BigDecimal;
 import java.time.LocalDateTime;
 
 @Data
-@TableName("program_ticket_category")
-public class TicketCategory {
-    @TableId(type = IdType.AUTO)
+@TableName("refund_record")
+public class RefundRecord {
+    @TableId(type = IdType.ASSIGN_ID)
     private Long id;
-    private Long programId;
-    private String name;
-    private BigDecimal price;
-    private Integer totalStock;
-    private Integer availableStock;
+    private Long orderId;
+    private String refundNo;
+    private BigDecimal refundAmount;
+    private Integer status;
+    private String reason;
+    private Integer retryCount;
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
 }

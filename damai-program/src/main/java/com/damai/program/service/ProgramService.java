@@ -22,10 +22,12 @@ import com.damai.program.mapper.TicketCategoryMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
@@ -46,6 +48,7 @@ public class ProgramService {
     private final RabbitTemplate rabbitTemplate;
     private final StockBucketService stockBucketService;
     private final StockRestoreRecordMapper stockRestoreRecordMapper;
+    private final TransactionTemplate transactionTemplate;
     @Value("${damai.grab.dedup-enabled:true}")
     private boolean grabDedupEnabled;
     @Value("${damai.grab.dedup-ttl-seconds:30}")
@@ -278,31 +281,9 @@ public class ProgramService {
                         .setSql("available_stock = available_stock + " + quantity));
     }
 
-    @org.springframework.transaction.annotation.Transactional
     public void restoreStockPrecisely(Long orderId, Long programId, Long categoryId, int quantity,
                                       String scene, boolean restoreDb) {
-        StockRestoreRecord record = stockRestoreRecordMapper.selectOne(
-                new LambdaQueryWrapper<StockRestoreRecord>()
-                        .eq(StockRestoreRecord::getOrderId, orderId)
-                        .eq(StockRestoreRecord::getScene, scene)
-                        .last("LIMIT 1"));
-        if (record == null) {
-            record = new StockRestoreRecord();
-            record.setId(IdWorker.getId());
-            record.setOrderId(orderId);
-            record.setScene(scene);
-            record.setStatus(StockRestoreStatusConstant.INIT);
-            try {
-                stockRestoreRecordMapper.insert(record);
-            } catch (Exception e) {
-                record = stockRestoreRecordMapper.selectOne(
-                        new LambdaQueryWrapper<StockRestoreRecord>()
-                                .eq(StockRestoreRecord::getOrderId, orderId)
-                                .eq(StockRestoreRecord::getScene, scene)
-                                .last("LIMIT 1"));
-            }
-        }
-
+        StockRestoreRecord record = getOrCreateRestoreRecord(orderId, scene);
         if (record == null || record.getStatus() == StockRestoreStatusConstant.SUCCESS) {
             return;
         }
@@ -316,21 +297,59 @@ public class ProgramService {
         }
 
         try {
-            stockBucketService.restore(programId, categoryId, quantity);
-            if (restoreDb) {
-                categoryMapper.update(null, new LambdaUpdateWrapper<TicketCategory>()
-                        .eq(TicketCategory::getId, categoryId)
-                        .setSql("available_stock = available_stock + " + quantity));
-            }
-            stockRestoreRecordMapper.update(null, new LambdaUpdateWrapper<StockRestoreRecord>()
-                    .eq(StockRestoreRecord::getId, record.getId())
-                    .set(StockRestoreRecord::getStatus, StockRestoreStatusConstant.SUCCESS));
+            transactionTemplate.executeWithoutResult(status -> {
+                if (restoreDb) {
+                    int rows = categoryMapper.update(null, new LambdaUpdateWrapper<TicketCategory>()
+                            .eq(TicketCategory::getId, categoryId)
+                            .setSql("available_stock = available_stock + " + quantity));
+                    if (rows != 1) {
+                        throw new BizException("DB库存回补失败");
+                    }
+                }
+
+                stockBucketService.restoreOnce(orderId, scene, programId, categoryId, quantity);
+
+                int successRows = stockRestoreRecordMapper.update(null, new LambdaUpdateWrapper<StockRestoreRecord>()
+                        .eq(StockRestoreRecord::getId, record.getId())
+                        .eq(StockRestoreRecord::getStatus, StockRestoreStatusConstant.PROCESSING)
+                        .set(StockRestoreRecord::getStatus, StockRestoreStatusConstant.SUCCESS));
+                if (successRows != 1) {
+                    throw new IllegalStateException("库存回补状态更新失败");
+                }
+            });
         } catch (Exception e) {
             stockRestoreRecordMapper.update(null, new LambdaUpdateWrapper<StockRestoreRecord>()
                     .eq(StockRestoreRecord::getId, record.getId())
                     .set(StockRestoreRecord::getStatus, StockRestoreStatusConstant.FAILED));
             throw e;
         }
+    }
+
+    private StockRestoreRecord getOrCreateRestoreRecord(Long orderId, String scene) {
+        StockRestoreRecord record = findRestoreRecord(orderId, scene);
+        if (record != null) {
+            return record;
+        }
+
+        record = new StockRestoreRecord();
+        record.setId(IdWorker.getId());
+        record.setOrderId(orderId);
+        record.setScene(scene);
+        record.setStatus(StockRestoreStatusConstant.INIT);
+        try {
+            stockRestoreRecordMapper.insert(record);
+            return record;
+        } catch (DuplicateKeyException e) {
+            return findRestoreRecord(orderId, scene);
+        }
+    }
+
+    private StockRestoreRecord findRestoreRecord(Long orderId, String scene) {
+        return stockRestoreRecordMapper.selectOne(
+                new LambdaQueryWrapper<StockRestoreRecord>()
+                        .eq(StockRestoreRecord::getOrderId, orderId)
+                        .eq(StockRestoreRecord::getScene, scene)
+                        .last("LIMIT 1"));
     }
 
     private void clearDedupKey(String dedupKey) {

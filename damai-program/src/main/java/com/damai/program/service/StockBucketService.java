@@ -19,6 +19,7 @@ public class StockBucketService {
     private final int bucketSize;
     private final int maxBuckets;
     private final DefaultRedisScript<String> deductScript;
+    private final DefaultRedisScript<Long> restoreOnceScript;
 
     public StockBucketService(StringRedisTemplate redisTemplate,
                               @Value("${damai.stock.bucket-size:500}") int bucketSize,
@@ -30,6 +31,10 @@ public class StockBucketService {
         this.deductScript = new DefaultRedisScript<>();
         this.deductScript.setResultType(String.class);
         this.deductScript.setLocation(new ClassPathResource("lua/deduct_bucket.lua"));
+
+        this.restoreOnceScript = new DefaultRedisScript<>();
+        this.restoreOnceScript.setResultType(Long.class);
+        this.restoreOnceScript.setLocation(new ClassPathResource("lua/restore_bucket_once.lua"));
     }
 
     /**
@@ -94,6 +99,17 @@ public class StockBucketService {
     }
 
     /**
+     * 按 orderId + scene 幂等回补，避免数据库事务回滚后 Redis 被重复加库存。
+     */
+    public void restoreOnce(Long orderId, String scene, Long programId, Long categoryId, int quantity) {
+        redisTemplate.execute(
+                restoreOnceScript,
+                List.of(restoreDoneKey(orderId, scene), bucketKey(programId, categoryId, 0)),
+                String.valueOf(quantity)
+        );
+    }
+
+    /**
      * 清理所有桶 key + count key
      */
     public void destroyBuckets(Long programId, Long categoryId) {
@@ -118,5 +134,9 @@ public class StockBucketService {
 
     private String bucketKey(Long programId, Long categoryId, int idx) {
         return RedisKeyConstant.STOCK_BUCKET + programId + ":" + categoryId + ":" + idx;
+    }
+
+    private String restoreDoneKey(Long orderId, String scene) {
+        return RedisKeyConstant.STOCK_RESTORE_DONE + scene + ":" + orderId;
     }
 }

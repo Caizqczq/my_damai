@@ -2,19 +2,27 @@ package com.damai.program.service;
 
 import com.alibaba.fastjson.JSON;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.toolkit.IdWorker;
+import com.damai.common.constant.StockRestoreStatusConstant;
 import com.damai.common.constant.MqConstant;
 import com.damai.common.constant.RedisKeyConstant;
 import com.damai.common.exception.BizException;
 import com.damai.common.mq.OrderCreateMessage;
-import com.damai.program.dto.*;
+import com.damai.program.dto.GrabRequest;
+import com.damai.program.dto.ProgramDetailDTO;
+import com.damai.program.dto.ProgramListItem;
+import com.damai.program.dto.StockDTO;
 import com.damai.program.entity.Program;
+import com.damai.program.entity.StockRestoreRecord;
 import com.damai.program.entity.TicketCategory;
 import com.damai.program.mapper.ProgramMapper;
+import com.damai.program.mapper.StockRestoreRecordMapper;
 import com.damai.program.mapper.TicketCategoryMapper;
 import com.github.benmanes.caffeine.cache.Cache;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
@@ -37,6 +45,11 @@ public class ProgramService {
     private final Cache<Long, ProgramDetailDTO> programDetailCache;
     private final RabbitTemplate rabbitTemplate;
     private final StockBucketService stockBucketService;
+    private final StockRestoreRecordMapper stockRestoreRecordMapper;
+    @Value("${damai.grab.dedup-enabled:true}")
+    private boolean grabDedupEnabled;
+    @Value("${damai.grab.dedup-ttl-seconds:30}")
+    private long grabDedupTtlSeconds;
 
     public void initStock(Long programId) {
         List<TicketCategory> cats = categoryMapper.selectList(
@@ -170,10 +183,13 @@ public class ProgramService {
         Long categoryId = req.getCategoryId();
         int quantity = req.getQuantity().intValue();
 
-        String dedupKey = "order:dedup:" + userId + ":" + programId + ":" + categoryId;
-        Boolean accepted = redisTemplate.opsForValue().setIfAbsent(dedupKey, "1", 30, TimeUnit.SECONDS);
-        if (!Boolean.TRUE.equals(accepted)) {
-            throw new BizException("请求过于频繁，请稍后再试");
+        String dedupKey = null;
+        if (grabDedupEnabled) {
+            dedupKey = "order:dedup:" + userId + ":" + programId + ":" + categoryId;
+            Boolean accepted = redisTemplate.opsForValue().setIfAbsent(dedupKey, "1", grabDedupTtlSeconds, TimeUnit.SECONDS);
+            if (!Boolean.TRUE.equals(accepted)) {
+                throw new BizException("请求过于频繁，请稍后再试");
+            }
         }
 
         // ===== Phase 1: 分桶 DECR 扣减库存（极轻量） =====
@@ -181,12 +197,12 @@ public class ProgramService {
         try {
             deducted = stockBucketService.deduct(programId, categoryId, quantity);
         } catch (Exception e) {
-            redisTemplate.delete(dedupKey);
+            clearDedupKey(dedupKey);
             throw e;
         }
 
         if (!deducted) {
-            redisTemplate.delete(dedupKey);
+            clearDedupKey(dedupKey);
             throw new BizException("库存不足");
         }
 
@@ -220,7 +236,7 @@ public class ProgramService {
             }
         } catch (Exception e) {
             log.error("MQ 发送失败, orderId={}", orderId, e);
-            redisTemplate.delete(dedupKey);
+            clearDedupKey(dedupKey);
             stockBucketService.restore(programId, categoryId, quantity);
             throw new BizException("系统繁忙，请稍后重试");
         }
@@ -260,5 +276,66 @@ public class ProgramService {
                 new com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper<TicketCategory>()
                         .eq(TicketCategory::getId, categoryId)
                         .setSql("available_stock = available_stock + " + quantity));
+    }
+
+    @org.springframework.transaction.annotation.Transactional
+    public void restoreStockPrecisely(Long orderId, Long programId, Long categoryId, int quantity,
+                                      String scene, boolean restoreDb) {
+        StockRestoreRecord record = stockRestoreRecordMapper.selectOne(
+                new LambdaQueryWrapper<StockRestoreRecord>()
+                        .eq(StockRestoreRecord::getOrderId, orderId)
+                        .eq(StockRestoreRecord::getScene, scene)
+                        .last("LIMIT 1"));
+        if (record == null) {
+            record = new StockRestoreRecord();
+            record.setId(IdWorker.getId());
+            record.setOrderId(orderId);
+            record.setScene(scene);
+            record.setStatus(StockRestoreStatusConstant.INIT);
+            try {
+                stockRestoreRecordMapper.insert(record);
+            } catch (Exception e) {
+                record = stockRestoreRecordMapper.selectOne(
+                        new LambdaQueryWrapper<StockRestoreRecord>()
+                                .eq(StockRestoreRecord::getOrderId, orderId)
+                                .eq(StockRestoreRecord::getScene, scene)
+                                .last("LIMIT 1"));
+            }
+        }
+
+        if (record == null || record.getStatus() == StockRestoreStatusConstant.SUCCESS) {
+            return;
+        }
+
+        int claimed = stockRestoreRecordMapper.update(null, new LambdaUpdateWrapper<StockRestoreRecord>()
+                .eq(StockRestoreRecord::getId, record.getId())
+                .in(StockRestoreRecord::getStatus, StockRestoreStatusConstant.INIT, StockRestoreStatusConstant.FAILED)
+                .set(StockRestoreRecord::getStatus, StockRestoreStatusConstant.PROCESSING));
+        if (claimed == 0) {
+            return;
+        }
+
+        try {
+            stockBucketService.restore(programId, categoryId, quantity);
+            if (restoreDb) {
+                categoryMapper.update(null, new LambdaUpdateWrapper<TicketCategory>()
+                        .eq(TicketCategory::getId, categoryId)
+                        .setSql("available_stock = available_stock + " + quantity));
+            }
+            stockRestoreRecordMapper.update(null, new LambdaUpdateWrapper<StockRestoreRecord>()
+                    .eq(StockRestoreRecord::getId, record.getId())
+                    .set(StockRestoreRecord::getStatus, StockRestoreStatusConstant.SUCCESS));
+        } catch (Exception e) {
+            stockRestoreRecordMapper.update(null, new LambdaUpdateWrapper<StockRestoreRecord>()
+                    .eq(StockRestoreRecord::getId, record.getId())
+                    .set(StockRestoreRecord::getStatus, StockRestoreStatusConstant.FAILED));
+            throw e;
+        }
+    }
+
+    private void clearDedupKey(String dedupKey) {
+        if (dedupKey != null) {
+            redisTemplate.delete(dedupKey);
+        }
     }
 }

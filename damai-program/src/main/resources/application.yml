@@ -52,6 +52,9 @@ damai:
   stock:
     bucket-size: 50000    # 每桶约装多少张票（库存/bucket-size=桶数）
     max-buckets: 32     # 单票档最大桶数上限
+  grab:
+    dedup-enabled: true
+    dedup-ttl-seconds: 30
 
 mybatis-plus:
   mapper-locations: classpath:mapper/*.xml

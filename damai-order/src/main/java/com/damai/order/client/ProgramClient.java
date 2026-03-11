@@ -2,6 +2,7 @@ package com.damai.order.client;
 
 import com.damai.common.mq.SeatAllocateRequest;
 import com.damai.common.mq.SeatAllocationResult;
+import com.damai.common.mq.StockRestoreTaskRequest;
 import com.damai.common.result.Result;
 import org.springframework.cloud.openfeign.FeignClient;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -22,4 +23,7 @@ public interface ProgramClient {
     Result<?> restoreStock(@RequestParam("programId") Long programId,
                            @RequestParam("categoryId") Long categoryId,
                            @RequestParam("quantity") int quantity);
+
+    @PostMapping("/api/program/internal/restoreStockTask")
+    Result<?> restoreStockTask(@RequestBody StockRestoreTaskRequest req);
 }

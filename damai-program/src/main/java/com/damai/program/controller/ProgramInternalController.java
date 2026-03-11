@@ -2,6 +2,7 @@ package com.damai.program.controller;
 
 import com.damai.common.mq.SeatAllocateRequest;
 import com.damai.common.mq.SeatAllocationResult;
+import com.damai.common.mq.StockRestoreTaskRequest;
 import com.damai.common.result.Result;
 import com.damai.program.service.ProgramService;
 import com.damai.program.service.SeatAllocationService;
@@ -35,6 +36,13 @@ public class ProgramInternalController {
                                   @RequestParam("categoryId") Long categoryId,
                                   @RequestParam("quantity") int quantity) {
         programService.restoreStock(programId, categoryId, quantity);
+        return Result.ok();
+    }
+
+    @PostMapping("/restoreStockTask")
+    public Result<?> restoreStockTask(@RequestBody StockRestoreTaskRequest req) {
+        programService.restoreStockPrecisely(req.getOrderId(), req.getProgramId(), req.getCategoryId(),
+                req.getQuantity(), req.getScene(), Boolean.TRUE.equals(req.getRestoreDb()));
         return Result.ok();
     }
 }

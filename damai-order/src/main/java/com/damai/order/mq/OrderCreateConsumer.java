@@ -4,8 +4,9 @@ import com.damai.common.constant.MqConstant;
 import com.damai.common.mq.OrderCreateMessage;
 import com.damai.order.client.ProgramClient;
 import com.damai.order.entity.TicketOrder;
-import com.damai.order.service.OutboxService;
 import com.damai.order.mapper.OrderMapper;
+import com.damai.order.service.OutboxService;
+import com.damai.order.service.StockTaskService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
@@ -26,6 +27,7 @@ public class OrderCreateConsumer {
     private final OrderMapper orderMapper;
     private final ProgramClient programClient;
     private final OutboxService outboxService;
+    private final StockTaskService stockTaskService;
 
     @Transactional
     @RabbitListener(queues = MqConstant.ORDER_CREATE, concurrency = "5-20")
@@ -35,10 +37,12 @@ public class OrderCreateConsumer {
             return;
         }
 
+        stockTaskService.initIfAbsent(msg.getOrderId(), msg.getProgramId(), msg.getCategoryId(), msg.getQuantity());
         var reserveResult = programClient.reserveDbStock(msg.getCategoryId(), msg.getQuantity());
         if (reserveResult.getCode() != 200) {
             throw new RuntimeException("DB库存占用失败: " + reserveResult.getMessage());
         }
+        stockTaskService.markReserveDbSuccess(msg.getOrderId());
 
         TicketOrder order = new TicketOrder();
         order.setId(msg.getOrderId());
